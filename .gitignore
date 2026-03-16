@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Simulation output
+phsp/
+
+# IDE
+.vscode/
+.cursor/
+
+# OS
+.DS_Store
