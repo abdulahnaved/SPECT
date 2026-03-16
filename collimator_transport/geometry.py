@@ -65,8 +65,9 @@ def build_world_and_collimator(sim):
     hole_region.translation = [0.0, 0.0, 0.0]
     hole_region.material = "G4_Pb"
 
-    # Fill the hole_region with cylindrical holes arranged on a hexagonal (triangular) lattice.
-    _fill_cylindrical_hex_holes(
+    # Fill the hole_region with cylindrical holes using RepeatParametrisedVolume.
+    # Much faster than creating individual volumes (~128k holes handled by Geant4 internally).
+    _fill_parametrised_hex_holes(
         sim,
         mother=hole_region,
         hole_diameter=hole_diameter,
@@ -102,7 +103,7 @@ def build_world_and_collimator(sim):
     return world, collimator, hole_region, col_front_plane, col_back_plane
 
 
-def _fill_cylindrical_hex_holes(
+def _fill_parametrised_hex_holes(
     sim,
     mother,
     hole_diameter: float,
@@ -112,64 +113,45 @@ def _fill_cylindrical_hex_holes(
     height: float,
 ):
     """
-    Approximate hexagonal holes with cylinders (Tubs) on a triangular lattice.
-
-    - Cylinder diameter = requested hole diameter.
-    - Center-to-center pitch in X = hole_diameter + septum_thickness.
-    - Row spacing (Y) = pitch_x * sqrt(3) / 2 (triangular packing).
-
-    Cylindrical holes are G4_AIR inside a lead bulk mother volume.
+    Use RepeatParametrisedVolume to create a hex-packed grid of cylindrical
+    air holes inside the lead hole_region. Geant4 handles all ~128k copies
+    internally — much faster than creating individual Python volumes.
     """
+    mm = gate.g4_units.mm
 
     pitch_x = hole_diameter + septum_thickness
     pitch_y = pitch_x * math.sqrt(3.0) / 2.0
 
-    # Number of holes that can fit along each direction (rough estimate)
     nx = int(extent_x // pitch_x)
     ny = int(extent_y // pitch_y)
 
-    # For performance while prototyping, cap the number of holes.
-    # You can increase these caps once you're happy with the geometry.
-    nx_cap = 120
-    ny_cap = 120
-    if nx > nx_cap:
-        nx = nx_cap
-    if ny > ny_cap:
-        ny = ny_cap
+    # Define a single prototype hole (cylinder) inside the hole region
+    hole = sim.add_volume("Tubs", "collimator_hole")
+    hole.mother = mother.name
+    hole.material = "G4_AIR"
+    hole.rmin = 0.0
+    hole.rmax = 0.5 * hole_diameter * mm
+    hole.dz = 0.5 * height * mm
+    hole.sphi = 0.0
+    hole.dphi = 2.0 * math.pi
 
-    r = 0.5 * hole_diameter
+    # Use RepeatParametrisedVolume for efficient replication.
+    # Construct the object directly and register it via add_volume.
+    from opengate.geometry.volumes import RepeatParametrisedVolume
 
-    created = 0
-    for j in range(ny):
-        # Center rows around 0 in Y
-        y = (j - (ny - 1) / 2.0) * pitch_y
+    param = RepeatParametrisedVolume(repeated_volume=hole, name="collimator_holes_param")
+    param.linear_repeat = [nx, ny, 1]
+    param.translation = [pitch_x * mm, pitch_y * mm, 0]
+    param.start = [
+        -(nx - 1) * pitch_x * mm / 2.0,
+        -(ny - 1) * pitch_y * mm / 2.0,
+        0,
+    ]
+    # Stagger every other row by half a pitch in X for hex packing
+    param.offset_nb = 1
+    param.offset = [0.5 * pitch_x * mm, 0, 0]
+    sim.add_volume(param)
 
-        # Stagger every other row to create triangular (hex-like) packing
-        x_offset = 0.0 if (j % 2 == 0) else 0.5 * pitch_x
-
-        for i in range(nx):
-            x = (i - (nx - 1) / 2.0) * pitch_x + x_offset
-
-            # Stay within the rectangular hole-region boundaries with a small margin
-            if abs(x) > 0.5 * extent_x - r or abs(y) > 0.5 * extent_y - r:
-                continue
-
-            name = f"collimator_hole_{i}_{j}"
-            hole = sim.add_volume("Tubs", name)
-            hole.mother = mother.name
-            hole.material = "G4_AIR"
-
-            # Tubs parameters: rmin, rmax, dz, sphi, dphi (angles in rad)
-            hole.rmin = 0.0
-            hole.rmax = r
-            hole.dz = 0.5 * height
-            hole.sphi = 0.0
-            hole.dphi = 2.0 * math.pi
-
-            # Local coordinates inside mother volume
-            hole.translation = [x, y, 0.0]
-
-            created += 1
-
-    print(f"Created {created} cylindrical holes inside the collimator.")
+    total = nx * ny
+    print(f"RepeatParametrisedVolume: {nx} x {ny} = {total} holes in the collimator.")
 
