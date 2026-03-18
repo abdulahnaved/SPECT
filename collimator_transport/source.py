@@ -25,7 +25,7 @@ def add_flood_source(sim, source_plane_z_mm=-20.0):
     src.particle = "gamma"
 
     # Number of particles (override with source.n or source.activity as needed)
-    src.n = 100_000_000
+    src.n = 1_000_000
 
     # Position: thin box = plane, 550 × 405 mm, centered at given Z
     src.position.type = "box"
