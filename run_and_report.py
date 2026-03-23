@@ -1,61 +1,27 @@
 """
-Run the SPECT collimator simulation and print basic phase-space stats.
+Quick single-batch run + report (for testing).
 
-Usage (from project root, with opengate_env activated):
+For parallel multi-batch runs use:
+    python -m collimator_transport.run --total 10000000 --batches 10 --workers 4
 
+Usage:
     python run_and_report.py
 """
 
 import sys
-
-import uproot
-
-from collimator_transport.main import build_simulation
-
-
-def run_simulation():
-    sim = build_simulation()
-    sim.run()
-
-
-def summarize_phsp():
-    try:
-        tin = uproot.open("phsp/collimator_incoming.root")["ps_incoming"]
-        tout = uproot.open("phsp/collimator_outgoing.root")["ps_outgoing"]
-    except Exception as e:
-        print(f"Could not open phase-space ROOT files: {e}")
-        return
-
-    # Energies in MeV
-    E_in = tin["KineticEnergy"].array()
-    E_out = tout["KineticEnergy"].array()
-
-    n_in = len(E_in)
-    n_out = len(E_out)
-
-    print("----- Phase-space summary -----")
-    print(f"N incoming photons: {n_in}")
-    print(f"N outgoing photons: {n_out}")
-    if n_in > 0:
-        print(f"Transmission fraction (N_out / N_in): {n_out / n_in:.6g}")
-
-    if n_in > 0:
-        print(
-            "First 5 incoming energies (keV):",
-            (E_in[:5] * 1000).tolist(),
-        )
-    if n_out > 0:
-        print(
-            "First 5 outgoing energies (keV):",
-            (E_out[:5] * 1000).tolist(),
-        )
+from collimator_transport.main import run_batch
 
 
 def main():
-    run_simulation()
-    summarize_phsp()
+    batch_dir = run_batch(
+        n_primaries=1_000_000,
+        seed=42,
+        batch_id=0,
+        output_dir="output",
+    )
+    print(f"\nDone. Output in: {batch_dir}")
+    print("Run 'python postprocess.py' to build the numpy array.")
 
 
 if __name__ == "__main__":
     sys.exit(main())
-

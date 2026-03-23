@@ -1,0 +1,16 @@
+[project]
+name = "spect-collimator-sim"
+version = "0.1.0"
+description = "OpenGATE SPECT collimator transport simulation"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "opengate",
+    "uproot",
+    "numpy",
+]
+
+[project.scripts]
+simulate = "collimator_transport.run:main"
+postprocess = "postprocess:main"
+inspect = "inspect_data:main"

@@ -24,9 +24,6 @@ def add_collimator_phase_space_actors(sim, col_front_plane, col_back_plane, pref
         Photons absorbed or leaving elsewhere simply do not appear and can be
         treated as having outgoing = 0 in post-processing.
     """
-    # Ensure output directory exists (relative to sim.output_dir)
-    if sim.output_dir is None:
-        sim.output_dir = "."
     subdir = Path("phsp")
 
     # Incoming phase space (front plane)

@@ -2,9 +2,12 @@
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
 
 # Simulation output
 phsp/
+output/
+*.npy
 
 # IDE
 .vscode/
@@ -12,3 +15,6 @@ phsp/
 
 # OS
 .DS_Store
+
+# uv / venv
+.venv/

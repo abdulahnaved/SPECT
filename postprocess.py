@@ -1,23 +1,19 @@
 """
-Post-processing: match incoming and outgoing photons from phase-space ROOT files.
+Post-processing: match incoming and outgoing photons across all batch directories.
 
-Strategy (optimized for large incoming files):
-  1. Load the SMALL outgoing file first.
-  2. Extract the set of (EventID, TrackID) pairs we need from outgoing.
-  3. Stream through the LARGE incoming file in chunks, keeping only rows
-     that match an outgoing event (+ a sample of non-matched for context).
-  4. Build the final numpy array.
+Scans output/batch_*/ for ROOT files, merges them, matches incoming→outgoing,
+and produces a single numpy array.
 
-Output: a numpy array where each row is one incoming photon, with columns:
+Output columns:
   [in_x, in_y, in_theta, in_phi, in_E,
    out_x, out_y, out_theta, out_phi, out_E]
 
-Outgoing columns are zero for incoming photons with no outgoing match.
-
 Usage:
-    python postprocess.py
+    python postprocess.py                          # default output/ dir
+    python postprocess.py --output-dir output      # explicit
 """
 
+import argparse
 import numpy as np
 import uproot
 from pathlib import Path
@@ -58,77 +54,68 @@ def direction_to_spherical(dx, dy, dz):
     return theta, phi
 
 
-def postprocess(
-    incoming_path="phsp/collimator_incoming.root",
-    outgoing_path="phsp/collimator_outgoing.root",
-    incoming_tree="ps_incoming",
-    outgoing_tree="ps_outgoing",
-    chunk_size=500_000,
-):
+def find_batch_dirs(output_dir="output"):
+    """Find all batch_XXXX directories under output_dir."""
+    root = Path(output_dir)
+    dirs = sorted(root.glob("batch_*"))
+    if not dirs:
+        # Fallback: check for legacy phsp/ directory
+        if (Path("phsp") / "collimator_incoming.root").exists():
+            return [Path(".")]
+    return dirs
+
+
+def load_and_merge_trees(batch_dirs, subpath, tree_name, branches):
+    """Load a tree from multiple batch directories and merge into one dict of arrays."""
+    all_chunks = {b: [] for b in branches}
+    total = 0
+
+    for bd in batch_dirs:
+        fpath = bd / subpath
+        if not fpath.exists() or fpath.stat().st_size == 0:
+            continue
+        f = uproot.open(str(fpath))
+        tree = f[tree_name]
+        arrays = tree.arrays(branches, library="numpy")
+        for b in branches:
+            all_chunks[b].append(arrays[b])
+        total += len(arrays[branches[0]])
+
+    if total == 0:
+        return None, 0
+
+    merged = {b: np.concatenate(all_chunks[b]) for b in branches}
+    return merged, total
+
+
+def postprocess(output_dir="output"):
     t0 = time.time()
 
-    # ------------------------------------------------------------------
-    # 1. Load outgoing (small file, ~MB)
-    # ------------------------------------------------------------------
-    out_path = Path(outgoing_path)
-    has_outgoing = out_path.exists() and out_path.stat().st_size > 0
+    batch_dirs = find_batch_dirs(output_dir)
+    print(f"Found {len(batch_dirs)} batch directories")
 
-    if has_outgoing:
-        print(f"Loading outgoing ({out_path.stat().st_size / 1e6:.1f} MB) ...")
-        f_out = uproot.open(outgoing_path)
-        out = f_out[outgoing_tree].arrays(OUTGOING_BRANCHES, library="numpy")
-        n_out = len(out["EventID"])
-        print(f"  {n_out} outgoing photons loaded in {time.time() - t0:.1f}s")
+    # Load outgoing (small)
+    print("Loading outgoing ROOT files ...")
+    out, n_out = load_and_merge_trees(
+        batch_dirs, Path("phsp") / "collimator_outgoing.root", "ps_outgoing", OUTGOING_BRANCHES
+    )
+    print(f"  {n_out} outgoing photons total")
 
-        out_evt = out["EventID"].astype(np.int64)
-        out_trk = out["TrackID"].astype(np.int64)
-        out_par = out["ParentID"].astype(np.int64)
+    # Load incoming (large, but streamed per batch)
+    print("Loading incoming ROOT files ...")
+    inc, n_in = load_and_merge_trees(
+        batch_dirs, Path("phsp") / "collimator_incoming.root", "ps_incoming", INCOMING_BRANCHES
+    )
+    print(f"  {n_in} incoming photons total (loaded in {time.time() - t0:.1f}s)")
 
-        # Keys we need to find in incoming:
-        # direct match keys (EventID, TrackID) and parent match keys (EventID, ParentID)
-        needed_keys = set(out_evt * PRIME + out_trk) | set(out_evt * PRIME + out_par)
-    else:
-        print("No outgoing file found.")
-        n_out = 0
-        needed_keys = set()
+    if inc is None or n_in == 0:
+        print("No incoming data found.")
+        return np.zeros((0, N_COLS))
 
-    # ------------------------------------------------------------------
-    # 2. Stream through incoming in chunks — collect ALL rows
-    # ------------------------------------------------------------------
-    t1 = time.time()
-    in_file = uproot.open(incoming_path)
-    in_tree = in_file[incoming_tree]
-    n_in_total = in_tree.num_entries
-    print(f"Incoming file: {n_in_total} entries, streaming in chunks of {chunk_size} ...")
-
-    all_in_chunks = []
-    total_loaded = 0
-
-    for chunk in in_tree.iterate(INCOMING_BRANCHES, library="numpy", step_size=chunk_size):
-        n_chunk = len(chunk["EventID"])
-        total_loaded += n_chunk
-        all_in_chunks.append(chunk)
-
-        if total_loaded % (chunk_size * 10) == 0 or total_loaded == n_in_total:
-            elapsed = time.time() - t1
-            pct = total_loaded / n_in_total * 100
-            print(f"  Loaded {total_loaded}/{n_in_total} ({pct:.0f}%) in {elapsed:.1f}s")
-
-    # Merge all chunks
-    print("Merging chunks ...")
-    inc = {key: np.concatenate([c[key] for c in all_in_chunks]) for key in INCOMING_BRANCHES}
-    del all_in_chunks
-    n_in = len(inc["EventID"])
-    print(f"  {n_in} incoming photons merged in {time.time() - t1:.1f}s")
-
-    # ------------------------------------------------------------------
-    # 3. Build result array
-    # ------------------------------------------------------------------
-    t2 = time.time()
-    print("Building result array ...")
+    # Build result
     keV = 1000.0
-
     result = np.zeros((n_in, N_COLS), dtype=np.float64)
+
     result[:, COL_IN_X] = inc["PrePosition_X"]
     result[:, COL_IN_Y] = inc["PrePosition_Y"]
     result[:, COL_IN_E] = inc["KineticEnergy"] * keV
@@ -139,18 +126,20 @@ def postprocess(
     result[:, COL_IN_THETA] = in_theta
     result[:, COL_IN_PHI] = in_phi
 
-    # ------------------------------------------------------------------
-    # 4. Match outgoing → incoming (vectorized where possible)
-    # ------------------------------------------------------------------
-    if has_outgoing and n_out > 0:
+    # Match outgoing → incoming
+    n_matched = 0
+    if out is not None and n_out > 0:
         print("Matching outgoing to incoming ...")
+        t2 = time.time()
 
         inc_evt = inc["EventID"].astype(np.int64)
         inc_trk = inc["TrackID"].astype(np.int64)
         inc_keys = inc_evt * PRIME + inc_trk
-
-        # Build lookup: key -> row index (last occurrence wins if duplicates)
         inc_key_to_row = dict(zip(inc_keys.tolist(), range(n_in)))
+
+        out_evt = out["EventID"].astype(np.int64)
+        out_trk = out["TrackID"].astype(np.int64)
+        out_par = out["ParentID"].astype(np.int64)
 
         out_keys_direct = (out_evt * PRIME + out_trk).tolist()
         out_keys_parent = (out_evt * PRIME + out_par).tolist()
@@ -167,7 +156,6 @@ def postprocess(
                 matched_out_idx.append(j)
 
         n_matched = len(matched_in_rows)
-        print(f"  {n_matched} outgoing matched to incoming")
 
         if n_matched > 0:
             rows = np.array(matched_in_rows, dtype=np.int64)
@@ -184,10 +172,8 @@ def postprocess(
             result[rows, COL_OUT_THETA] = out_theta
             result[rows, COL_OUT_PHI] = out_phi
             result[rows, COL_OUT_E] = out["KineticEnergy"][idx] * keV
-    else:
-        n_matched = 0
 
-    print(f"  Done in {time.time() - t2:.1f}s")
+        print(f"  Done in {time.time() - t2:.1f}s")
 
     _print_summary(result, n_in, n_matched)
     return result
@@ -204,22 +190,28 @@ def _print_summary(result, n_in, n_matched):
         print(f"Transmission fraction: {n_with_out / n_in:.6g}")
     print(f"\nOutput array shape: {result.shape}")
     print(f"Columns: {COLUMN_NAMES}")
-    print(f"\nFirst 5 rows (all):")
     np.set_printoptions(precision=3, suppress=True, linewidth=120)
+    print(f"\nFirst 5 rows:")
     print(result[:5])
-
-    # Show some matched rows
     matched_mask = result[:, COL_OUT_E] > 0
     if matched_mask.any():
         print(f"\nFirst 5 rows with outgoing photon:")
         print(result[matched_mask][:5])
 
 
-if __name__ == "__main__":
+def main():
+    parser = argparse.ArgumentParser(description="Post-process SPECT simulation batches")
+    parser.add_argument("--output-dir", type=str, default="output", help="Top-level output directory")
+    args = parser.parse_args()
+
     t_start = time.time()
-    result = postprocess()
+    result = postprocess(output_dir=args.output_dir)
 
     out_file = Path("postprocessed_data.npy")
     np.save(out_file, result)
     print(f"\nSaved to {out_file} ({result.nbytes / 1e6:.1f} MB)")
     print(f"Total post-processing time: {time.time() - t_start:.1f}s")
+
+
+if __name__ == "__main__":
+    main()

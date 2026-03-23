@@ -5,7 +5,7 @@ Gamma, uniform 20–250 keV, hemisphere toward the collimator (+Z).
 import opengate as gate
 
 
-def add_flood_source(sim, source_plane_z_mm=-20.0):
+def add_flood_source(sim, source_plane_z_mm=-20.0, n_primaries=1_000_000):
     """
     Add a flood (plane) source in front of the collimator.
 
@@ -24,8 +24,7 @@ def add_flood_source(sim, source_plane_z_mm=-20.0):
     src = sim.add_source("GenericSource", "flood_source")
     src.particle = "gamma"
 
-    # Number of particles (override with source.n or source.activity as needed)
-    src.n = 1_000_000
+    src.n = n_primaries
 
     # Position: thin box = plane, 550 × 405 mm, centered at given Z
     src.position.type = "box"
