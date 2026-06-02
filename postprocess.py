@@ -1,16 +1,18 @@
 """
 Post-processing: match incoming and outgoing photons across all batch directories.
 
-Scans output/batch_*/ for ROOT files, merges them, matches incoming→outgoing,
-and produces a single numpy array.
+Scans output/batch_*/ for ROOT files, matches incoming→outgoing inside each
+batch, and produces a single numpy array.
 
 Output columns:
   [in_x, in_y, in_theta, in_phi, in_E,
    out_x, out_y, out_theta, out_phi, out_E]
 
 Usage:
-    python postprocess.py                          # default output/ dir
-    python postprocess.py --output-dir output      # explicit
+    python postprocess.py                                    # all photons
+    python postprocess.py --class-filter xray                # xray only
+    python postprocess.py --class-filter scatter             # scatter only
+    python postprocess.py --class-filter direct              # direct only
 """
 
 import argparse
@@ -44,6 +46,25 @@ OUTGOING_BRANCHES = [
     "PostDirection_X", "PostDirection_Y", "PostDirection_Z",
     "KineticEnergy",
 ]
+
+
+def classify_chunk(chunk):
+    """Return integer class label per row: 0=blocked, 1=direct, 2=xray, 3=scatter."""
+    out_E = chunk[:, COL_OUT_E]
+    in_E  = chunk[:, COL_IN_E]
+    passed = out_E > 0
+    direct  = passed & (np.abs(out_E - in_E) / np.where(in_E > 0, in_E, 1.0) < 0.05)
+    xray    = passed & ~direct & (out_E >= 70) & (out_E <= 90) & (in_E > 95)
+    scatter = passed & ~direct & ~xray
+    labels = np.zeros(len(chunk), dtype=np.int8)
+    labels[direct]  = 1
+    labels[xray]    = 2
+    labels[scatter] = 3
+    return labels
+
+
+CLASS_NAMES = {1: "direct", 2: "xray", 3: "scatter"}
+CLASS_IDS   = {"direct": 1, "xray": 2, "scatter": 3}
 
 
 def direction_to_spherical(dx, dy, dz):
@@ -88,31 +109,20 @@ def load_and_merge_trees(batch_dirs, subpath, tree_name, branches):
     return merged, total
 
 
-def postprocess(output_dir="output"):
-    t0 = time.time()
+def load_tree(batch_dir, subpath, tree_name, branches):
+    """Load one ROOT tree from one batch directory."""
+    fpath = batch_dir / subpath
+    if not fpath.exists() or fpath.stat().st_size == 0:
+        return None, 0
+    f = uproot.open(str(fpath))
+    tree = f[tree_name]
+    arrays = tree.arrays(branches, library="numpy")
+    return arrays, len(arrays[branches[0]])
 
-    batch_dirs = find_batch_dirs(output_dir)
-    print(f"Found {len(batch_dirs)} batch directories")
 
-    # Load outgoing (small)
-    print("Loading outgoing ROOT files ...")
-    out, n_out = load_and_merge_trees(
-        batch_dirs, Path("phsp") / "collimator_outgoing.root", "ps_outgoing", OUTGOING_BRANCHES
-    )
-    print(f"  {n_out} outgoing photons total")
-
-    # Load incoming (large, but streamed per batch)
-    print("Loading incoming ROOT files ...")
-    inc, n_in = load_and_merge_trees(
-        batch_dirs, Path("phsp") / "collimator_incoming.root", "ps_incoming", INCOMING_BRANCHES
-    )
-    print(f"  {n_in} incoming photons total (loaded in {time.time() - t0:.1f}s)")
-
-    if inc is None or n_in == 0:
-        print("No incoming data found.")
-        return np.zeros((0, N_COLS))
-
-    # Build result
+def build_batch_result(inc, out):
+    """Build matched rows for one batch only."""
+    n_in = len(inc["EventID"])
     keV = 1000.0
     result = np.zeros((n_in, N_COLS), dtype=np.float64)
 
@@ -126,56 +136,128 @@ def postprocess(output_dir="output"):
     result[:, COL_IN_THETA] = in_theta
     result[:, COL_IN_PHI] = in_phi
 
-    # Match outgoing → incoming
-    n_matched = 0
-    if out is not None and n_out > 0:
-        print("Matching outgoing to incoming ...")
-        t2 = time.time()
+    if out is None or len(out["EventID"]) == 0:
+        return result, 0
 
-        inc_evt = inc["EventID"].astype(np.int64)
-        inc_trk = inc["TrackID"].astype(np.int64)
-        inc_keys = inc_evt * PRIME + inc_trk
-        inc_key_to_row = dict(zip(inc_keys.tolist(), range(n_in)))
+    inc_evt = inc["EventID"].astype(np.int64)
+    inc_trk = inc["TrackID"].astype(np.int64)
+    inc_keys = inc_evt * PRIME + inc_trk
+    inc_key_to_row = dict(zip(inc_keys.tolist(), range(n_in)))
 
-        out_evt = out["EventID"].astype(np.int64)
-        out_trk = out["TrackID"].astype(np.int64)
-        out_par = out["ParentID"].astype(np.int64)
+    out_evt = out["EventID"].astype(np.int64)
+    out_trk = out["TrackID"].astype(np.int64)
+    out_par = out["ParentID"].astype(np.int64)
 
-        out_keys_direct = (out_evt * PRIME + out_trk).tolist()
-        out_keys_parent = (out_evt * PRIME + out_par).tolist()
+    out_keys_direct = (out_evt * PRIME + out_trk).tolist()
+    out_keys_parent = (out_evt * PRIME + out_par).tolist()
 
-        matched_in_rows = []
-        matched_out_idx = []
+    matched_in_rows = []
+    matched_out_idx = []
 
-        for j in range(n_out):
-            row = inc_key_to_row.get(out_keys_direct[j], -1)
-            if row == -1:
-                row = inc_key_to_row.get(out_keys_parent[j], -1)
-            if row >= 0:
-                matched_in_rows.append(row)
-                matched_out_idx.append(j)
+    for j in range(len(out_evt)):
+        row = inc_key_to_row.get(out_keys_direct[j], -1)
+        if row == -1:
+            row = inc_key_to_row.get(out_keys_parent[j], -1)
+        if row >= 0:
+            matched_in_rows.append(row)
+            matched_out_idx.append(j)
 
-        n_matched = len(matched_in_rows)
+    n_matched = len(matched_in_rows)
+    if n_matched == 0:
+        return result, 0
 
-        if n_matched > 0:
-            rows = np.array(matched_in_rows, dtype=np.int64)
-            idx = np.array(matched_out_idx, dtype=np.int64)
+    rows = np.array(matched_in_rows, dtype=np.int64)
+    idx = np.array(matched_out_idx, dtype=np.int64)
 
-            out_theta, out_phi = direction_to_spherical(
-                out["PostDirection_X"][idx],
-                out["PostDirection_Y"][idx],
-                out["PostDirection_Z"][idx],
-            )
+    out_theta, out_phi = direction_to_spherical(
+        out["PostDirection_X"][idx],
+        out["PostDirection_Y"][idx],
+        out["PostDirection_Z"][idx],
+    )
 
-            result[rows, COL_OUT_X] = out["PostPosition_X"][idx]
-            result[rows, COL_OUT_Y] = out["PostPosition_Y"][idx]
-            result[rows, COL_OUT_THETA] = out_theta
-            result[rows, COL_OUT_PHI] = out_phi
-            result[rows, COL_OUT_E] = out["KineticEnergy"][idx] * keV
+    result[rows, COL_OUT_X] = out["PostPosition_X"][idx]
+    result[rows, COL_OUT_Y] = out["PostPosition_Y"][idx]
+    result[rows, COL_OUT_THETA] = out_theta
+    result[rows, COL_OUT_PHI] = out_phi
+    result[rows, COL_OUT_E] = out["KineticEnergy"][idx] * keV
 
-        print(f"  Done in {time.time() - t2:.1f}s")
+    return result, n_matched
 
-    _print_summary(result, n_in, n_matched)
+
+def postprocess(output_dir="output", out_file="postprocessed_data.npy", class_filter=None):
+    t0 = time.time()
+
+    batch_dirs = find_batch_dirs(output_dir)
+    print(f"Found {len(batch_dirs)} batch directories")
+    if class_filter:
+        print(f"Class filter: {class_filter} only")
+
+    # --- pass 1: enumerate valid dirs (and count rows for full-save mode) ---
+    print("Pass 1: counting rows...")
+    valid_dirs = []
+    row_counts = []
+    for bd in batch_dirs:
+        fpath = bd / Path("phsp") / "collimator_incoming.root"
+        if not fpath.exists() or fpath.stat().st_size == 0:
+            continue
+        f = uproot.open(str(fpath))
+        n = int(f["ps_incoming"].num_entries)
+        valid_dirs.append(bd)
+        row_counts.append(n)
+    total_rows = int(sum(row_counts))
+    print(f"Total incoming rows: {total_rows:,} across {len(valid_dirs)} batches")
+
+    # --- pass 2: process batch by batch ---
+    print("Pass 2: processing batches...")
+    total_out = 0
+    total_matched = 0
+
+    if class_filter:
+        # filtered mode: accumulate only matching rows in memory (tiny for xray/scatter)
+        target_id = CLASS_IDS[class_filter]
+        filtered_chunks = []
+
+        for bd, n_in in zip(valid_dirs, row_counts):
+            inc, _ = load_tree(bd, Path("phsp") / "collimator_incoming.root", "ps_incoming", INCOMING_BRANCHES)
+            out, n_out = load_tree(bd, Path("phsp") / "collimator_outgoing.root", "ps_outgoing", OUTGOING_BRANCHES)
+            if inc is None:
+                continue
+            chunk, n_matched = build_batch_result(inc, out)
+            mask = classify_chunk(chunk) == target_id
+            n_kept = int(mask.sum())
+            if n_kept > 0:
+                filtered_chunks.append(chunk[mask])
+            total_out += n_out
+            total_matched += n_matched
+            print(f"  {bd.name}: incoming={n_in}, matched={n_matched}, kept({class_filter})={n_kept}")
+
+        result = np.concatenate(filtered_chunks, axis=0) if filtered_chunks else np.zeros((0, N_COLS), dtype=np.float64)
+        np.save(out_file, result)
+        print(f"\nSaved {len(result):,} {class_filter} rows to {out_file}")
+
+    else:
+        # full mode: memmap to avoid RAM blow-up
+        result = np.lib.format.open_memmap(out_file, mode="w+", dtype=np.float64, shape=(total_rows, N_COLS))
+        offset = 0
+
+        for bd, n_in in zip(valid_dirs, row_counts):
+            inc, _ = load_tree(bd, Path("phsp") / "collimator_incoming.root", "ps_incoming", INCOMING_BRANCHES)
+            out, n_out = load_tree(bd, Path("phsp") / "collimator_outgoing.root", "ps_outgoing", OUTGOING_BRANCHES)
+            if inc is None:
+                continue
+            chunk, n_matched = build_batch_result(inc, out)
+            result[offset:offset + n_in] = chunk
+            offset += n_in
+            total_out += n_out
+            total_matched += n_matched
+            print(f"  {bd.name}: incoming={n_in}, outgoing={n_out}, matched={n_matched}")
+
+        result.flush()
+
+    print(f"Loaded and matched in {time.time() - t0:.1f}s")
+    print(f"Outgoing photons total: {total_out}")
+
+    _print_summary(result, total_rows if not class_filter else len(result), total_matched)
     return result
 
 
@@ -202,13 +284,13 @@ def _print_summary(result, n_in, n_matched):
 def main():
     parser = argparse.ArgumentParser(description="Post-process SPECT simulation batches")
     parser.add_argument("--output-dir", type=str, default="output", help="Top-level output directory")
+    parser.add_argument("--out-file", type=str, default="postprocessed_data.npy", help="Output .npy file")
+    parser.add_argument("--class-filter", type=str, choices=["direct", "xray", "scatter"], default=None, help="Only save rows of this physical class")
     args = parser.parse_args()
 
     t_start = time.time()
-    result = postprocess(output_dir=args.output_dir)
-
-    out_file = Path("postprocessed_data.npy")
-    np.save(out_file, result)
+    out_file = Path(args.out_file)
+    result = postprocess(output_dir=args.output_dir, out_file=str(out_file), class_filter=args.class_filter)
     print(f"\nSaved to {out_file} ({result.nbytes / 1e6:.1f} MB)")
     print(f"Total post-processing time: {time.time() - t_start:.1f}s")
 

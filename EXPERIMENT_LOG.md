@@ -1,0 +1,423 @@
+# Experiment Log
+
+This file tracks model/data changes and their results. The goal is to keep a clear record of what changed, why it changed, and whether it helped.
+
+## Current Baseline: 100M Collimator Dataset
+
+### Data
+
+```text
+simulation: OpenGATE/Geant4 collimator transport
+total primaries: 100M
+processed incoming rows: 85,116,126
+passed photons: 117,743
+transmission: 0.138%
+```
+
+### Important Postprocessing Fix
+
+Changed photon matching from:
+
+```text
+merge all batches -> match incoming/outgoing
+```
+
+to:
+
+```text
+match incoming/outgoing inside each batch -> combine matched batches
+```
+
+Reason: `EventID` can repeat across batches, so matching after merging can pair photons from different batches incorrectly.
+
+### Baseline Models
+
+Classifier:
+
+```text
+task: incoming photon -> pass/not-pass
+architecture: 5 -> 64 -> 64 -> 1
+hidden layers: 2
+neurons per hidden layer: 64
+activation: ReLU
+training data: balanced passed/not-passed sample
+```
+
+Regressor:
+
+```text
+task: incoming photon -> outgoing photon values
+architecture: 5 -> 64 -> 64 -> 5
+hidden layers: 2
+neurons per hidden layer: 64
+activation: ReLU
+training data: passed photons only
+```
+
+### Results
+
+Classifier test results:
+
+```text
+balanced accuracy: 91.9%
+precision: 91.3%
+recall: 92.7%
+specificity: 91.1%
+```
+
+Regressor test errors:
+
+```text
+out_x MAE:      3.36 mm
+out_y MAE:      3.63 mm
+out_theta MAE:  0.065 rad
+out_phi MAE:    0.268 rad
+out_E MAE:      11.23 keV
+```
+
+### Validation Notes
+
+Global 1D histograms match reasonably well, especially outgoing position.
+
+Known weaknesses:
+
+```text
+classifier underpredicts pass probability at higher incoming energies
+regressor smooths sharp energy features around ~75-90 keV
+direction variables show spread in predicted-vs-Monte-Carlo scatter plots
+```
+
+Professor noted that the jumps around ~80 keV are most likely characteristic X-rays of lead.
+
+Interpretation:
+
+```text
+The baseline is useful, but a deterministic regressor is not enough for Monte Carlo-like sampling.
+```
+
+## Architecture Search: Deeper and Wider Networks
+
+### What Changed
+
+Upgraded `train_prototype.py` to support configurable architectures via `--hidden-dims`, with optional `--batchnorm` and `--dropout`. Also added:
+
+```text
+ReduceLROnPlateau scheduler (halves LR when val loss stagnates)
+early stopping with patience
+gradient clipping (max_norm=5.0)
+best-model restore at end of training
+auto-named output directories (e.g. h4_w256, h4_w256_bn)
+```
+
+All runs used the same data, seed, and train/val/test split for fair comparison.
+
+### Results
+
+| Architecture | Params | Cls bal_acc | out_x MAE | out_y MAE | out_theta MAE | out_phi MAE | out_E MAE |
+|---|---|---|---|---|---|---|---|
+| 2×64 (baseline) | ~8K | 91.9% | 3.36 mm | 3.63 mm | 0.065 rad | 0.268 rad | 11.23 keV |
+| 4×256 | 199K | **95.05%** | **2.08 mm** | **1.91 mm** | **0.049 rad** | **0.247 rad** | 10.52 keV |
+| 4×512 | 791K | 94.97% | 2.57 mm | 2.55 mm | 0.053 rad | 0.270 rad | 11.14 keV |
+| 4×256 + BN | 201K | 94.61% | 2.89 mm | 2.75 mm | 0.054 rad | 0.260 rad | 10.32 keV |
+| 4×512 + BN + DO=0.1 | 796K | 94.08% | 2.73 mm | 2.58 mm | 0.050 rad | **0.242 rad** | 10.50 keV |
+
+### Findings
+
+```text
+best overall:       4×256, no regularization (h4_w256)
+best out_phi:       4×512 + BN + Dropout=0.1 (0.242 rad)
+going wider:        hurts — 4×512 is worse than 4×256 across the board
+adding BatchNorm:   hurts position and classifier, marginal effect on energy
+adding Dropout:     helps out_phi slightly but hurts everything else
+```
+
+Architecture is near its ceiling for this loss function and dataset size.
+
+### Why the Remaining Errors Are Hard to Fix
+
+```text
+out_phi:  two symmetric peaks at ±π/2. A point-estimate regressor predicts the
+          mean between them, which is not a real physical value.
+
+out_E:    sharp Pb characteristic X-ray spikes at ~75-88 keV. These are
+          discrete atomic emissions, not a smooth function of incoming energy.
+          MSE regression averages over them and smooths the spikes out.
+```
+
+Conclusion: further architecture tuning will not meaningfully reduce out_phi or out_E errors. The problem is the loss function and model type, not the depth or width.
+
+## Multi-Class Classifier And Per-Class Regressors
+
+### What Changed
+
+Replaced the binary pass/fail classifier with a 4-class classifier. Classes are defined from the postprocessed data:
+
+```text
+0  blocked  out_E == 0
+1  direct   out_E > 0, |out_E - in_E| / in_E < 5%
+2  xray     out_E > 0, out_E in [70, 90] keV, in_E > 95 keV
+3  scatter  out_E > 0, not direct, not xray
+```
+
+Trained one 4-class classifier and three separate regressors (one per pass class).
+
+### Class Distribution In 100M Dataset
+
+```text
+blocked :  84,998,383  (99.862%)
+direct  :     108,649  (0.128%)
+xray    :       6,740  (0.008%)
+scatter :       2,354  (0.003%)
+```
+
+xray and scatter are extremely rare.
+
+### Results
+
+Classifier:
+
+```text
+overall accuracy: 74.6%
+blocked  accuracy: 75.3%
+direct   accuracy: 77.3%
+xray     accuracy: 21.7%   ← poor — too few examples
+scatter  accuracy: 61.3%
+```
+
+Regressor MAE:
+
+```text
+             out_x    out_y  out_theta  out_phi   out_E
+direct        1.11     1.00      0.006    0.037    0.44   ← excellent
+xray          4.35     8.48      0.299    1.540    4.90   ← poor
+scatter       7.57     8.90      0.274    1.582   13.78   ← poor
+```
+
+### Key Findings
+
+**Direct regressor is a major breakthrough:**
+
+Separating direct photons (in ≈ out) from xray and scatter photons makes the direct mapping nearly trivial. MAE dropped by roughly 2x on position and 7x on direction compared to the single binary regressor.
+
+**Xray and scatter regressors fail due to data scarcity, not architecture:**
+
+With only 6,740 xray and 2,354 scatter photons in 85M total, there is not enough signal to train a reliable regressor. The xray out_E histogram clearly shows two distinct Pb K X-ray lines (Kα ~75 keV, Kβ ~85 keV) which the NN merges into one smeared peak — a sign of averaging over a multi-modal distribution with too few samples.
+
+**Conclusion:**
+
+Architecture changes will not fix xray and scatter. The problem is data scarcity. A larger simulation is needed to produce enough rare-event photons.
+
+### What The Plots Show
+
+```text
+direct:   near-perfect overlap on all outputs — ready for GAN stage
+xray:     out_theta predicted at wrong angle, out_phi collapses to zero,
+          out_E merges the two Pb K lines into one broad peak
+scatter:  nothing matches — distributions are completely off
+```
+
+## Open Questions And Next Steps
+
+### Immediate: More Simulation Data
+
+To make xray and scatter models work, we need more passed photons of each type.
+
+Rough targets:
+
+```text
+current xray:    6,740  — need ~50,000+ for reliable modelling
+current scatter: 2,354  — need ~20,000+ for reliable modelling
+```
+
+To get 10x more xray and scatter photons, we need roughly a 1 billion primary simulation.
+
+This should be discussed with the professor before running.
+
+### Next Model Stage: Conditional GAN For Direct Photons
+
+The direct regressor is already good but still deterministic. For a proper Monte Carlo surrogate, the model needs to sample from a distribution.
+
+Proposed approach:
+
+```text
+generator:     incoming photon (5 values) + latent noise (z) -> outgoing photon (5 values)
+discriminator: (incoming photon, outgoing photon) -> real or generated
+training data: direct photons only (108,649 available — sufficient)
+```
+
+This is the natural next step once the professor has reviewed the current findings.
+
+### Longer Term: Xray And Scatter Generative Models
+
+Once more simulation data is available, the same conditional GAN approach can be applied per class. The xray generator has a particularly constrained output (energy is nearly fixed by atomic physics) which may make it easier to learn with a physics-informed prior.
+
+---
+
+## GAN Training On 1B Simulation Data
+
+**Date:** 2026-05-25
+**Script:** `train_gan.py` — WGAN-GP conditional GAN, one model per physical class
+**Data:** `/media/storage/nabdullah/postprocessed_1B.npy` (851,474,815 rows total)
+**Architecture:** Generator and Critic both 4×256 MLP, z_dim=16 (32 for direct), GP lambda=10, n_critic=5
+
+### 1B Dataset Statistics
+
+```text
+total incoming:      851,474,815
+passed photons:        1,085,697  (0.13%)
+
+class breakdown:
+  direct  :    759,832  (70.0% of passed)
+  xray    :     47,043  (4.3%  of passed)
+  scatter :     16,924  (1.6%  of passed)
+  blocked : ~850,389,118 (99.87% of all)
+```
+
+Compared to 100M simulation: xray went from 6,740 → 47,043 (~7x), scatter from 2,354 → 16,924 (~7x). Not quite the 10x needed.
+
+### GAN Architecture And Training Setup
+
+```python
+class Generator(nn.Module):
+    # input: 5 (in photon) + z_dim (noise) -> 5 (out photon)
+    self.net = build_mlp(5 + z_dim, 5, hidden_dims)
+
+class Critic(nn.Module):
+    # input: 5 (in photon) + 5 (out photon) -> scalar score
+    self.net = build_mlp(10, 1, hidden_dims, dropout=0.1)
+```
+
+Training: Adam lr=1e-4, 5 critic steps per generator step, 200–300 epochs, batch=512.
+Best generator restored by lowest validation Wasserstein distance.
+
+### Results: Direct GAN (z_dim=32, 300 epochs)
+
+```text
+best_val_w:  -0.098
+final MAE:
+  out_x:      5.49 mm
+  out_y:      2.99 mm
+  out_theta:  0.020 rad
+  out_phi:    0.050 rad
+  out_E:      1.35 keV
+train/val rows: 759,832 / 162,821
+```
+
+**Histogram analysis:**
+
+```text
+out_x, out_y:   tight, near-perfect overlap with real data
+out_theta:      excellent — distribution shape matches
+out_phi:        peaks correct but magnitude slightly soft (generator under-samples the sharp peaks)
+out_E:          excellent — ~140 keV peak reproduced cleanly
+```
+
+Overall the direct GAN captures the distribution well. The slight softness in `out_phi` is expected — WGAN-GP encourages broad coverage rather than sharp peaks. More latent dimensions (z_dim=32 vs 16) helped.
+
+**Key insight — GAN vs Regressor:**
+The regressor MAE on direct (out_phi ≈ 0.037 rad) looks better than GAN MAE (0.050 rad) but this comparison is misleading. The regressor predicts the conditional mean — it cannot produce the spread of the real distribution. The GAN samples from the distribution, which is what a Monte Carlo surrogate needs. MAE is the wrong metric for generative models.
+
+### Results: Xray GAN (z_dim=16, 200 epochs)
+
+```text
+best_val_w:  -2.225
+final MAE:
+  out_x:     129.2 mm
+  out_y:      90.8 mm
+  out_theta:   0.32 rad
+  out_phi:     1.57 rad
+  out_E:       4.37 keV
+train/val rows: 47,043 / 10,080
+```
+
+**Diagnosis: mode collapse.** The Wasserstein distance is ~22x worse than the direct GAN. All positional MAEs are at noise floor (129 mm, 90 mm). The generator is not learning the conditional mapping.
+
+Root cause: 47,043 samples is still insufficient for a 5→5 conditional generative model with this architecture. The GAN needs to learn a complex conditional distribution over all 5 output dimensions simultaneously.
+
+### Results: Scatter GAN (z_dim=16, 200 epochs)
+
+```text
+best_val_w:  -2.199
+final MAE:
+  out_x:     129.4 mm
+  out_y:      90.3 mm
+  out_theta:   0.28 rad
+  out_phi:     1.59 rad
+  out_E:      36.4 keV
+train/val rows: 16,924 / 3,626
+```
+
+**Diagnosis: mode collapse.** Same pattern as xray — worst-case MAEs, near-random output. 16,924 samples is far too few for GAN training on 5 output dimensions. The energy MAE of 36 keV (vs ~8 keV typical Compton scatter spread) confirms the generator is not tracking the real distribution.
+
+### Key Findings
+
+**Direct GAN works — ready for integration:**
+
+The direct class GAN (70% of all passed photons) achieves good distributional fidelity. It is the primary path to a working Monte Carlo surrogate and covers the dominant physical process through the collimator.
+
+**Xray and scatter need at least 10x more data:**
+
+Even with 1B primary photons, xray (47K) and scatter (17K) fall short. Rough minimum estimate for GAN training: ~500K per class. That implies ~10B primary photons.
+
+**Alternative for xray: physics-constrained model**
+
+The xray energy distribution is nearly deterministic (Pb Kα ≈ 75 keV, Kβ ≈ 85 keV fixed by atomic physics). A physics-informed conditional model — e.g. fix out_E to a mixture of the two lines and only learn the positional/angular output — could work with far fewer samples.
+
+### Updated Next Steps
+
+```text
+1. Integrate direct GAN into full pipeline as primary surrogate
+2. For xray: try physics-constrained generator (fix out_E distribution, learn position/angle only)
+3. Decide with supervisor whether to run ~10B simulation for scatter class
+4. Evaluation: compare full GAN pipeline against reference MC on aggregate image quality metrics
+```
+
+---
+
+## Supervisor Feedback And 10B Simulation
+
+**Date:** 2026-06-02
+
+### Supervisor Feedback (Prof. Ádám Zlehovszky)
+
+Feedback confirmed the architecture is correct:
+
+> "I think, maybe you should make 3 different GANs, one for each detected class. The classifier should be multiclass, and we will implement Markov chain during sampling: 1. select class via classifier output, 2. use class GAN to produce sample."
+
+This is exactly what was already built. The supervisor independently arrived at the same two-stage pipeline. Conclusion: architecture is validated. The only remaining problem is data scarcity for xray and scatter.
+
+> "We probably need more samples for xray and scatter."
+
+Additional suggestion: modify the simulator to only save a specific class, run multiple instances with different seeds, and merge for training. This is already supported by the batch runner (different seeds per batch). Only the class filtering in postprocessing needed to be added.
+
+### What Changed: Class Filter In postprocess.py
+
+Added `--class-filter` argument to `postprocess.py`. When set, only rows matching the specified physical class are saved.
+
+```bash
+uv run python postprocess.py --output-dir output --out-file xray.npy --class-filter xray
+uv run python postprocess.py --output-dir output --out-file scatter.npy --class-filter scatter
+```
+
+Implementation: `classify_chunk()` assigns class labels using the same physics rules as the GAN trainer. Filtered mode skips the memmap (output is tiny) and accumulates matching rows in memory before saving. Full mode (no filter) retains the existing two-pass memmap approach.
+
+This means you can run many parallel simulation instances targeting rare classes and collect only the photons of interest — no wasted storage on 99.87% blocked photons.
+
+### 10B Simulation Started
+
+Command:
+
+```bash
+uv run python -m collimator_transport.run --total 10000000000 --batches 1000 --workers 36 --output-dir output_10B
+```
+
+Expected yield (linear extrapolation from 1B run):
+
+```text
+xray:    ~470,000  (up from 47,043)
+scatter: ~170,000  (up from 16,924)
+```
+
+xray at ~470K should be sufficient for GAN training. Scatter at ~170K is borderline — may require a second run or a physics-constrained approach.
+
+Once complete, postprocess with class filters and retrain xray and scatter GANs.
