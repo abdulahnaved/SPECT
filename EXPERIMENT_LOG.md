@@ -216,41 +216,6 @@ xray:     out_theta predicted at wrong angle, out_phi collapses to zero,
 scatter:  nothing matches — distributions are completely off
 ```
 
-## Open Questions And Next Steps
-
-### Immediate: More Simulation Data
-
-To make xray and scatter models work, we need more passed photons of each type.
-
-Rough targets:
-
-```text
-current xray:    6,740  — need ~50,000+ for reliable modelling
-current scatter: 2,354  — need ~20,000+ for reliable modelling
-```
-
-To get 10x more xray and scatter photons, we need roughly a 1 billion primary simulation.
-
-This should be discussed with the professor before running.
-
-### Next Model Stage: Conditional GAN For Direct Photons
-
-The direct regressor is already good but still deterministic. For a proper Monte Carlo surrogate, the model needs to sample from a distribution.
-
-Proposed approach:
-
-```text
-generator:     incoming photon (5 values) + latent noise (z) -> outgoing photon (5 values)
-discriminator: (incoming photon, outgoing photon) -> real or generated
-training data: direct photons only (108,649 available — sufficient)
-```
-
-This is the natural next step once the professor has reviewed the current findings.
-
-### Longer Term: Xray And Scatter Generative Models
-
-Once more simulation data is available, the same conditional GAN approach can be applied per class. The xray generator has a particularly constrained output (energy is nearly fixed by atomic physics) which may make it easier to learn with a physics-informed prior.
-
 ---
 
 ## GAN Training On 1B Simulation Data
@@ -361,63 +326,36 @@ Even with 1B primary photons, xray (47K) and scatter (17K) fall short. Rough min
 
 **Alternative for xray: physics-constrained model**
 
-The xray energy distribution is nearly deterministic (Pb Kα ≈ 75 keV, Kβ ≈ 85 keV fixed by atomic physics). A physics-informed conditional model — e.g. fix out_E to a mixture of the two lines and only learn the positional/angular output — could work with far fewer samples.
-
-### Updated Next Steps
-
-```text
-1. Integrate direct GAN into full pipeline as primary surrogate
-2. For xray: try physics-constrained generator (fix out_E distribution, learn position/angle only)
-3. Decide with supervisor whether to run ~10B simulation for scatter class
-4. Evaluation: compare full GAN pipeline against reference MC on aggregate image quality metrics
-```
+The xray energy distribution is nearly deterministic (Pb Kα ≈ 75 keV, Kβ ≈ 85 keV fixed by atomic physics). A physics-informed conditional model could work with far fewer samples.
 
 ---
 
-## Supervisor Feedback And 10B Simulation
+## Class Filter In postprocess.py And 10B Simulation
 
 **Date:** 2026-06-02
 
-### Supervisor Feedback (Prof. Ádám Zlehovszky)
+### What Changed
 
-Feedback confirmed the architecture is correct:
-
-> "I think, maybe you should make 3 different GANs, one for each detected class. The classifier should be multiclass, and we will implement Markov chain during sampling: 1. select class via classifier output, 2. use class GAN to produce sample."
-
-This is exactly what was already built. The supervisor independently arrived at the same two-stage pipeline. Conclusion: architecture is validated. The only remaining problem is data scarcity for xray and scatter.
-
-> "We probably need more samples for xray and scatter."
-
-Additional suggestion: modify the simulator to only save a specific class, run multiple instances with different seeds, and merge for training. This is already supported by the batch runner (different seeds per batch). Only the class filtering in postprocessing needed to be added.
-
-### What Changed: Class Filter In postprocess.py
-
-Added `--class-filter` argument to `postprocess.py`. When set, only rows matching the specified physical class are saved.
+Added `--class-filter` argument to `postprocess.py`. When set, only rows matching the specified physical class are saved instead of the full array.
 
 ```bash
 uv run python postprocess.py --output-dir output --out-file xray.npy --class-filter xray
 uv run python postprocess.py --output-dir output --out-file scatter.npy --class-filter scatter
 ```
 
-Implementation: `classify_chunk()` assigns class labels using the same physics rules as the GAN trainer. Filtered mode skips the memmap (output is tiny) and accumulates matching rows in memory before saving. Full mode (no filter) retains the existing two-pass memmap approach.
+`classify_chunk()` assigns class labels using the same physics rules as the GAN trainer. Filtered mode accumulates matching rows in memory (output is tiny) rather than using memmap.
 
-This means you can run many parallel simulation instances targeting rare classes and collect only the photons of interest — no wasted storage on 99.87% blocked photons.
+### 10B Simulation
 
-### 10B Simulation Started
-
-Command:
+Started a 10B primary simulation using all 36 server cores:
 
 ```bash
 uv run python -m collimator_transport.run --total 10000000000 --batches 1000 --workers 36 --output-dir output_10B
 ```
 
-Expected yield (linear extrapolation from 1B run):
+Expected yield extrapolated from 1B run:
 
 ```text
 xray:    ~470,000  (up from 47,043)
 scatter: ~170,000  (up from 16,924)
 ```
-
-xray at ~470K should be sufficient for GAN training. Scatter at ~170K is borderline — may require a second run or a physics-constrained approach.
-
-Once complete, postprocess with class filters and retrain xray and scatter GANs.
