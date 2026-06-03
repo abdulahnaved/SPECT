@@ -24,11 +24,13 @@ import time
 
 COL_IN_X, COL_IN_Y, COL_IN_THETA, COL_IN_PHI, COL_IN_E = 0, 1, 2, 3, 4
 COL_OUT_X, COL_OUT_Y, COL_OUT_THETA, COL_OUT_PHI, COL_OUT_E = 5, 6, 7, 8, 9
-N_COLS = 10
+COL_IS_SECONDARY = 10   # 1 if outgoing photon is a secondary (TrackID > 1), 0 otherwise
+N_COLS = 11
 
 COLUMN_NAMES = [
     "in_x", "in_y", "in_theta", "in_phi", "in_E",
     "out_x", "out_y", "out_theta", "out_phi", "out_E",
+    "is_secondary",
 ]
 
 PRIME = np.int64(1_000_000_007)
@@ -50,12 +52,13 @@ OUTGOING_BRANCHES = [
 
 def classify_chunk(chunk):
     """Return integer class label per row: 0=blocked, 1=direct, 2=xray, 3=scatter."""
-    out_E = chunk[:, COL_OUT_E]
-    in_E  = chunk[:, COL_IN_E]
-    passed = out_E > 0
-    direct  = passed & (np.abs(out_E - in_E) / np.where(in_E > 0, in_E, 1.0) < 0.05)
-    xray    = passed & ~direct & (out_E >= 70) & (out_E <= 90) & (in_E > 95)
-    scatter = passed & ~direct & ~xray
+    out_E        = chunk[:, COL_OUT_E]
+    in_E         = chunk[:, COL_IN_E]
+    is_secondary = chunk[:, COL_IS_SECONDARY] > 0
+    passed  = out_E > 0
+    xray    = passed & is_secondary
+    direct  = passed & ~is_secondary & (np.abs(out_E - in_E) / np.where(in_E > 0, in_E, 1.0) < 0.05)
+    scatter = passed & ~is_secondary & ~direct
     labels = np.zeros(len(chunk), dtype=np.int8)
     labels[direct]  = 1
     labels[xray]    = 2
@@ -180,6 +183,7 @@ def build_batch_result(inc, out):
     result[rows, COL_OUT_THETA] = out_theta
     result[rows, COL_OUT_PHI] = out_phi
     result[rows, COL_OUT_E] = out["KineticEnergy"][idx] * keV
+    result[rows, COL_IS_SECONDARY] = (out["TrackID"][idx] > 1).astype(np.float64)
 
     return result, n_matched
 

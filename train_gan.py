@@ -29,26 +29,27 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 
-IN_COLS  = [0, 1, 2, 3, 4]
-OUT_COLS = [5, 6, 7, 8, 9]
-IN_E     = 4
-OUT_E    = 9
+IN_COLS          = [0, 1, 2, 3, 4]
+OUT_COLS         = [5, 6, 7, 8, 9]
+OUT_COLS_SPATIAL = [5, 6, 7, 8]        # x, y, theta, phi — no energy
+OUT_E_COL        = 9
+IS_SECONDARY_COL = 10                  # 1 if outgoing photon is secondary (Pb K X-ray)
+IN_E             = 4
+OUT_E            = 9
+OUT_NAMES_ALL    = ["out_x", "out_y", "out_theta", "out_phi", "out_E"]
 
-# class definition thresholds — must match train_multiclass.py
-XRAY_LO          = 70.0
-XRAY_HI          = 90.0
-XRAY_MIN_IN_E    = 95.0
-DIRECT_REL_TOL   = 0.05
+DIRECT_REL_TOL = 0.05
 
 
 def get_class_indices(data, class_name):
-    in_e  = data[:, IN_E]
-    out_e = data[:, OUT_E]
+    out_e        = data[:, OUT_E]
+    in_e         = data[:, IN_E]
+    is_secondary = data[:, IS_SECONDARY_COL] > 0
 
     passed  = out_e > 0
-    xray    = passed & (out_e >= XRAY_LO) & (out_e <= XRAY_HI) & (in_e > XRAY_MIN_IN_E)
-    direct  = passed & ~xray & (np.abs(out_e - in_e) / np.maximum(in_e, 1e-6) < DIRECT_REL_TOL)
-    scatter = passed & ~xray & ~direct
+    xray    = passed & is_secondary
+    direct  = passed & ~is_secondary & (np.abs(out_e - in_e) / np.maximum(in_e, 1e-6) < DIRECT_REL_TOL)
+    scatter = passed & ~is_secondary & ~direct
 
     mapping = {"direct": direct, "xray": xray, "scatter": scatter}
     if class_name not in mapping:
@@ -88,28 +89,37 @@ def build_mlp(in_dim, out_dim, hidden_dims, dropout=0.0):
 
 
 class Generator(nn.Module):
-    """
-    Takes incoming photon (5) + noise (z_dim) and produces outgoing photon (5).
-    """
-    def __init__(self, z_dim=16, hidden_dims=(256, 256, 256, 256)):
+    def __init__(self, z_dim=16, hidden_dims=(256, 256, 256, 256), out_dim=5):
         super().__init__()
-        self.net = build_mlp(5 + z_dim, 5, hidden_dims)
+        self.net = build_mlp(5 + z_dim, out_dim, hidden_dims)
 
     def forward(self, x_in, z):
         return self.net(torch.cat([x_in, z], dim=1))
 
 
 class Critic(nn.Module):
-    """
-    Takes incoming photon (5) + outgoing photon (5) and scores how real the pair looks.
-    No sigmoid — WGAN critic outputs a raw score.
-    """
-    def __init__(self, hidden_dims=(256, 256, 256, 256), dropout=0.1):
+    def __init__(self, hidden_dims=(256, 256, 256, 256), dropout=0.1, in_dim=10):
         super().__init__()
-        self.net = build_mlp(10, 1, hidden_dims, dropout=dropout)
+        self.net = build_mlp(in_dim, 1, hidden_dims, dropout=dropout)
 
     def forward(self, x_in, x_out):
         return self.net(torch.cat([x_in, x_out], dim=1)).squeeze(1)
+
+
+def build_energy_pmf(energies, n_bins=500):
+    """Measure empirical energy distribution as a discrete PMF."""
+    counts, edges = np.histogram(energies, bins=n_bins)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    mask    = counts > 0
+    centers = centers[mask].astype(np.float32)
+    probs   = (counts[mask] / counts[mask].sum()).astype(np.float32)
+    return centers, probs
+
+
+def sample_energy(pmf_centers, pmf_probs, n):
+    """Sample n energy values from the empirical PMF."""
+    idx = np.random.choice(len(pmf_centers), size=n, p=pmf_probs)
+    return pmf_centers[idx]
 
 
 def gradient_penalty(critic, x_in, real_out, fake_out, device):
@@ -143,7 +153,7 @@ def make_loader(x, y, batch_size, shuffle):
 
 
 def make_regression_plots(y_true, y_pred, out_file, title):
-    names = ["out_x", "out_y", "out_theta", "out_phi", "out_E"]
+    names = OUT_NAMES_ALL
     fig, axes = plt.subplots(2, 3, figsize=(12, 7))
     axes = axes.ravel()
     for i, name in enumerate(names):
@@ -159,29 +169,35 @@ def make_regression_plots(y_true, y_pred, out_file, title):
     plt.close(fig)
 
 
-def evaluate_generator(generator, x_test, y_test, y_mean, y_std, z_dim, device, n_samples=5):
+def evaluate_generator(generator, x_test, y_test_full, y_mean, y_std, z_dim, device,
+                       n_samples=5, fix_energy=False, pmf_centers=None, pmf_probs=None):
     """
-    For each test incoming photon, sample n_samples outgoing photons from the generator.
-    Report MAE against the single real outgoing value as a basic sanity check.
-    Also return one set of samples for histogram comparison.
+    Generate n_samples outgoing photons per test input.
+    If fix_energy: spatial output from GAN, energy sampled from empirical PMF.
+    y_test_full always has 5 columns for MAE comparison.
     """
     generator.eval()
     all_preds = []
     x_t = torch.tensor(x_test, dtype=torch.float32).to(device)
+    n   = len(x_t)
 
     with torch.no_grad():
         for _ in range(n_samples):
-            z = torch.randn(len(x_t), z_dim, device=device)
+            z      = torch.randn(n, z_dim, device=device)
             pred_s = generator(x_t, z).cpu().numpy()
-            pred   = pred_s * y_std + y_mean
+            pred   = pred_s * y_std + y_mean  # denorm spatial (4 or 5 cols)
+
+            if fix_energy:
+                e = sample_energy(pmf_centers, pmf_probs, n).reshape(-1, 1)
+                pred = np.concatenate([pred, e], axis=1)  # now 5 cols
+
             all_preds.append(pred)
 
-    # average over samples for MAE (single-sample comparison)
     mean_pred = np.mean(all_preds, axis=0)
-    mae = np.mean(np.abs(mean_pred - y_test), axis=0)
+    mae = np.mean(np.abs(mean_pred - y_test_full), axis=0)
 
     generator.train()
-    return mae, all_preds[0]  # first sample for histograms
+    return mae, all_preds[0]
 
 
 def train(args):
@@ -207,15 +223,36 @@ def train(args):
     y_val   = np.asarray(data[val_idx][:, OUT_COLS],   dtype=np.float32)
     y_test  = np.asarray(data[test_idx][:, OUT_COLS],  dtype=np.float32)
 
+    fix_energy  = args.fix_energy
+    pmf_centers = pmf_probs = None
+
+    if fix_energy:
+        # keep full y_test for MAE comparison, but train only on spatial outputs
+        e_train     = np.asarray(data[train_idx][:, OUT_E_COL], dtype=np.float32)
+        pmf_centers, pmf_probs = build_energy_pmf(e_train)
+        print(f"  Energy PMF built from {len(e_train):,} samples, {len(pmf_centers)} bins")
+        y_train = np.asarray(data[train_idx][:, OUT_COLS_SPATIAL], dtype=np.float32)
+        y_val   = np.asarray(data[val_idx][:, OUT_COLS_SPATIAL],   dtype=np.float32)
+        # y_test keeps all 5 cols for evaluation
+        y_test  = np.asarray(data[test_idx][:, OUT_COLS], dtype=np.float32)
+        out_dim  = 4
+        crit_dim = 9   # 5 incoming + 4 spatial
+    else:
+        out_dim  = 5
+        crit_dim = 10
+
     x_mean, x_std, (x_train_s, x_val_s, x_test_s) = standardize_from_train(x_train, x_val, x_test)
-    y_mean, y_std, (y_train_s, y_val_s, y_test_s) = standardize_from_train(y_train, y_val, y_test)
+    if fix_energy:
+        y_mean, y_std, (y_train_s, y_val_s) = standardize_from_train(y_train, y_val)
+    else:
+        y_mean, y_std, (y_train_s, y_val_s, _) = standardize_from_train(y_train, y_val, y_test)
 
     train_loader = make_loader(x_train_s, y_train_s, args.batch_size, shuffle=True)
     val_loader   = make_loader(x_val_s,   y_val_s,   args.batch_size, shuffle=False)
 
     hidden_dims = tuple(args.hidden_dims)
-    G = Generator(z_dim=args.z_dim, hidden_dims=hidden_dims).to(device)
-    C = Critic(hidden_dims=hidden_dims, dropout=0.1).to(device)
+    G = Generator(z_dim=args.z_dim, hidden_dims=hidden_dims, out_dim=out_dim).to(device)
+    C = Critic(hidden_dims=hidden_dims, dropout=0.1, in_dim=crit_dim).to(device)
 
     opt_G = torch.optim.Adam(G.parameters(), lr=args.lr, betas=(0.0, 0.9))
     opt_C = torch.optim.Adam(C.parameters(), lr=args.lr, betas=(0.0, 0.9))
@@ -293,32 +330,38 @@ def train(args):
 
         if epoch % args.plot_every == 0:
             G.load_state_dict(best_G_state)
-            mae, y_sample = evaluate_generator(G, x_test_s, y_test, y_mean, y_std, args.z_dim, device)
+            mae, y_sample = evaluate_generator(G, x_test_s, y_test, y_mean, y_std, args.z_dim, device,
+                                               fix_energy=fix_energy, pmf_centers=pmf_centers, pmf_probs=pmf_probs)
             make_regression_plots(y_test, y_sample, out_dir / f"gan_histograms_epoch{epoch:03d}.png", f"GAN {args.cls} — epoch {epoch}")
-            out_names = ["out_x", "out_y", "out_theta", "out_phi", "out_E"]
-            mae_str = "  ".join(f"{n}={v:.4f}" for n, v in zip(out_names, mae))
+            mae_str = "  ".join(f"{n}={v:.4f}" for n, v in zip(OUT_NAMES_ALL, mae))
             print(f"  [eval] MAE: {mae_str}")
 
     # final evaluation with best generator
     G.load_state_dict(best_G_state)
-    mae, y_sample = evaluate_generator(G, x_test_s, y_test, y_mean, y_std, args.z_dim, device, n_samples=10)
+    mae, y_sample = evaluate_generator(G, x_test_s, y_test, y_mean, y_std, args.z_dim, device, n_samples=10,
+                                       fix_energy=fix_energy, pmf_centers=pmf_centers, pmf_probs=pmf_probs)
     make_regression_plots(y_test, y_sample, out_dir / "gan_histograms_final.png", f"GAN {args.cls} — final")
 
-    torch.save({
+    checkpoint = {
         "generator_state": best_G_state,
         "z_dim": args.z_dim,
         "hidden_dims": list(hidden_dims),
         "x_mean": x_mean, "x_std": x_std,
         "y_mean": y_mean, "y_std": y_std,
         "input_columns": IN_COLS,
-        "output_columns": OUT_COLS,
+        "output_columns": OUT_COLS_SPATIAL if fix_energy else OUT_COLS,
         "class": args.cls,
+        "fix_energy": fix_energy,
         "history": history,
-    }, out_dir / "generator.pt")
+    }
+    if fix_energy:
+        checkpoint["pmf_centers"] = pmf_centers
+        checkpoint["pmf_probs"]   = pmf_probs
+    torch.save(checkpoint, out_dir / "generator.pt")
 
-    out_names = ["out_x", "out_y", "out_theta", "out_phi", "out_E"]
     report = {
         "class": args.cls,
+        "fix_energy": fix_energy,
         "data_file": args.data,
         "train_rows": int(len(train_idx)),
         "val_rows": int(len(val_idx)),
@@ -326,15 +369,16 @@ def train(args):
         "z_dim": args.z_dim,
         "hidden_dims": list(hidden_dims),
         "best_val_w": float(best_val_w),
-        "final_mae": {n: float(v) for n, v in zip(out_names, mae)},
+        "final_mae": {n: float(v) for n, v in zip(OUT_NAMES_ALL, mae)},
     }
     (out_dir / "report.json").write_text(json.dumps(report, indent=2))
 
     print("\n=== Summary ===")
     print(f"Class: {args.cls}")
+    print(f"Fix energy: {fix_energy}")
     print(f"Best val Wasserstein: {best_val_w:.4f}")
     print("Final MAE (avg over 10 samples):")
-    for n, v in zip(out_names, mae):
+    for n, v in zip(OUT_NAMES_ALL, mae):
         print(f"  {n}: {v:.4f}")
 
 
@@ -355,10 +399,13 @@ def main():
     parser.add_argument("--hidden-dims", type=int, nargs="+", default=[256, 256, 256, 256])
     parser.add_argument("--plot-every", type=int,   default=20,
                         help="Save histogram plots every N epochs")
+    parser.add_argument("--fix-energy", action="store_true",
+                        help="For xray: learn only spatial outputs, sample energy from empirical PMF")
     args = parser.parse_args()
 
     if args.out_dir is None:
-        args.out_dir = f"ml_artifacts/gan_{args.cls}"
+        suffix = "_fixE" if args.fix_energy else ""
+        args.out_dir = f"ml_artifacts/gan_{args.cls}{suffix}"
 
     train(args)
 

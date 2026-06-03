@@ -216,7 +216,7 @@ xray:     out_theta predicted at wrong angle, out_phi collapses to zero,
 scatter:  nothing matches — distributions are completely off
 ```
 
----
+
 
 ## GAN Training On 1B Simulation Data
 
@@ -326,36 +326,140 @@ Even with 1B primary photons, xray (47K) and scatter (17K) fall short. Rough min
 
 **Alternative for xray: physics-constrained model**
 
-The xray energy distribution is nearly deterministic (Pb Kα ≈ 75 keV, Kβ ≈ 85 keV fixed by atomic physics). A physics-informed conditional model could work with far fewer samples.
+The xray energy distribution is nearly deterministic (Pb Kα ≈ 75 keV, Kβ ≈ 85 keV fixed by atomic physics). A physics-informed conditional model — e.g. fix out_E to a mixture of the two lines and only learn the positional/angular output — could work with far fewer samples.
 
 ---
 
-## Class Filter In postprocess.py And 10B Simulation
+## GAN Training On 10B Data (Xray And Scatter)
 
-**Date:** 2026-06-02
+**Date:** 2026-06-03
+**Data:** xray_10B.npy (676,692 rows), scatter_10B.npy (244,025 rows)
+**Architecture:** same as 1B run — Generator and Critic 4×256, z_dim=32, GP lambda=10, n_critic=5, 300 epochs
+
+### Dataset Yield From 10B Simulation
+
+```text
+xray:    676,692  (up from 47,043 in 1B — ~14x)
+scatter: 244,025  (up from 16,924 in 1B — ~14x)
+```
+
+### Results: Xray GAN
+
+```text
+best_val_w:  -0.2975
+final MAE:
+  out_x:      8.93 mm
+  out_y:     12.22 mm
+  out_theta:  0.31 rad
+  out_phi:    1.59 rad
+  out_E:      4.79 keV
+```
+
+### Results: Scatter GAN
+
+```text
+best_val_w:  -1.2189
+final MAE:
+  out_x:     38.63 mm
+  out_y:     51.99 mm
+  out_theta:  0.32 rad
+  out_phi:    2.34 rad
+  out_E:     17.82 keV
+```
+
+### Histogram Analysis
+
+**Xray:**
+```text
+out_x, out_y:  near-perfect overlap — position learned well
+out_theta:     correct general shape, sharp spike near 0 is softer than MC
+out_phi:       GAN produces broad bumps at correct positions (-2, +2 rad)
+               but cannot reproduce the razor-sharp MC spikes
+out_E:         GAN learned the correct energy range (~70-90 keV)
+               but outputs a broad smear instead of the 4 discrete Pb K lines
+```
+
+**Scatter:**
+```text
+out_x, out_y:  rough shape correct but distributions are shifted
+out_theta:     GAN misses the sharp peak near 0, produces broad bell instead
+out_phi:       complete failure — MC has two sharp spikes at ±2.5 rad,
+               GAN outputs a flat blob
+out_E:         broad high-energy hump (100-250 keV) captured reasonably,
+               low-energy cluster near 75 keV missed entirely
+```
+
+### Key Findings
+
+**Xray position is solved.** With 676K samples, the xray GAN learned position very well. This is a clear improvement over the 1B run where position was at noise floor.
+
+**The phi sharpness problem is not a data problem.** Both xray and scatter have the same failure: real MC out_phi has razor-sharp discrete spikes, and the GAN produces broad bumps at the right locations. This is a fundamental limitation of continuous generators — they cannot reproduce delta-function-like distributions. More data will not fix this.
+
+**Xray out_E is a quantization problem.** The 4 discrete Pb K emission lines are fixed atomic physics values, not a continuous distribution. A continuous GAN will always smear them. The correct approach is to sample out_E from a discrete mixture of the known lines, not learn it.
+
+**Scatter is still partially failing.** Wasserstein improved 1.8x over 1B run but position MAEs (38-52mm) are still far from usable. The scatter distribution is genuinely more complex than xray — wide energy range, broad angular spread — and may need architectural changes in addition to more data.
+
+**Scatter out_E spikes are misclassified xray photons.** The scatter out_E histogram has sharp spikes at exactly ~73 and ~75 keV — the Pb Kα line energies. These are Pb K X-rays, not Compton scattered photons. The cause is a wrong threshold in the class definition: `XRAY_MIN_IN_E = 95 keV`. The Pb K-edge (minimum incoming energy needed to produce a Pb K X-ray) is **88 keV**, not 95 keV. Photons entering with in_E between 88–95 keV can produce Pb K X-rays but get classified as scatter. Fix: lower `XRAY_MIN_IN_E` to 88 keV in both `postprocess.py` and `train_gan.py`.
+
+---
+
+## Physics-Correct Class Definition Using TrackID
+
+**Date:** 2026-06-03
+
+### Problem With Energy-Threshold Classification
+
+The previous xray class definition used energy thresholds:
+
+```python
+xray = out_E in [70, 90] keV AND in_E > 95 keV
+```
+
+This is imprecise. The 95 keV threshold was arbitrary — the real physics threshold is the Pb K-edge at 88 keV. Any photon entering with in_E > 88 keV can produce a Pb K X-ray. This caused photons with in_E between 88–95 keV to be misclassified as scatter, producing the ~73–75 keV spikes visible in the scatter out_E histogram.
+
+### Fix: TrackID-Based Classification
+
+In Geant4, every particle has a TrackID:
+
+```
+TrackID = 1  →  primary particle (original photon from source)
+TrackID > 1  →  secondary particle (new particle created during simulation)
+```
+
+A Pb K X-ray is always a secondary — it is a new photon born inside the lead atom. The original scattered photon is always primary (TrackID = 1). This gives exact classification with no thresholds:
+
+```
+xray    =  passed AND is_secondary (TrackID > 1)
+direct  =  passed AND primary AND |out_E - in_E| / in_E < 5%
+scatter =  passed AND primary AND not direct
+```
 
 ### What Changed
 
-Added `--class-filter` argument to `postprocess.py`. When set, only rows matching the specified physical class are saved instead of the full array.
+Added column 10 (`is_secondary`) to the postprocessed `.npy` array:
 
-```bash
-uv run python postprocess.py --output-dir output --out-file xray.npy --class-filter xray
-uv run python postprocess.py --output-dir output --out-file scatter.npy --class-filter scatter
+```python
+COL_IS_SECONDARY = 10   # 1 if outgoing TrackID > 1, else 0
+N_COLS = 11
 ```
 
-`classify_chunk()` assigns class labels using the same physics rules as the GAN trainer. Filtered mode accumulates matching rows in memory (output is tiny) rather than using memmap.
+Updated `classify_chunk()` in `postprocess.py` and `get_class_indices()` in `train_gan.py` to use `is_secondary` instead of energy thresholds.
 
-### 10B Simulation
+Re-running postprocess on 10B data to produce corrected files:
 
-Started a 10B primary simulation using all 36 server cores:
-
-```bash
-uv run python -m collimator_transport.run --total 10000000000 --batches 1000 --workers 36 --output-dir output_10B
+```
+xray_10B_v2.npy    — xray photons with physics-correct TrackID definition
+scatter_10B_v2.npy — scatter photons, now clean of misclassified Pb K X-rays
 ```
 
-Expected yield extrapolated from 1B run:
+### Xray GAN With Fixed Energy (fix-energy mode)
 
-```text
-xray:    ~470,000  (up from 47,043)
-scatter: ~170,000  (up from 16,924)
+While waiting for v2 data, training xray GAN on old xray_10B.npy with `--fix-energy` flag. In this mode:
+
 ```
+generator learns:  out_x, out_y, out_theta, out_phi  (4 outputs)
+energy at inference: sampled from empirical PMF built from training data
+```
+
+Generator: 5+z_dim → 4, Critic: 9 → 1. Energy PMF built from 473,684 training samples, 467 bins. Best val_w reached ~-0.22 around epoch 102 before oscillating — best checkpoint saved automatically.
+
