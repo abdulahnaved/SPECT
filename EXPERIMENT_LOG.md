@@ -463,3 +463,69 @@ energy at inference: sampled from empirical PMF built from training data
 
 Generator: 5+z_dim → 4, Critic: 9 → 1. Energy PMF built from 473,684 training samples, 467 bins. Best val_w reached ~-0.22 around epoch 102 before oscillating — best checkpoint saved automatically.
 
+---
+
+## GAN Retraining On v2 Data (TrackID Classification)
+
+**Date:** 2026-06-04
+**Data:** xray_10B_v2.npy, scatter_10B_v2.npy
+**Change:** TrackID-based classification replaces energy threshold classification
+
+### Dataset Sizes
+
+```text
+xray_v2:    not yet recorded (similar to 676K + 88-95 keV additions)
+scatter_v2: 219,704  (down from 244,025 — misclassified Pb K photons removed)
+```
+
+### Results: Xray v2 GAN (fix-energy, z_dim=32, 300 epochs)
+
+```text
+best_val_w:  -0.2421
+final MAE:
+  out_x:      9.59 mm
+  out_y:      9.97 mm
+  out_theta:  0.31 rad
+  out_phi:    1.60 rad
+  out_E:      4.87 keV
+```
+
+### Results: Scatter v2 GAN (z_dim=32, 300 epochs)
+
+```text
+best_val_w:  -0.6628
+final MAE:
+  out_x:     10.96 mm
+  out_y:     10.26 mm
+  out_theta:  0.28 rad
+  out_phi:    1.65 rad
+  out_E:     14.39 keV
+```
+
+### Histogram Analysis
+
+**Xray v2:**
+```text
+out_x, out_y:  good overlap, position well learned
+out_theta:     sharp near-zero spike slightly softer than MC but improved
+out_phi:       broad bumps at correct locations, spikes not reproduced
+out_E:         all 4 Pb K lines now visible including 85-87 keV Kβ lines
+               — v2 data fixed the missing Kβ lines from old 95 keV threshold
+```
+
+**Scatter v2:**
+```text
+out_x, out_y:  near-perfect overlap — massive improvement over v1
+out_theta:     shape mostly right, GAN slightly broader
+out_phi:       broad bumps instead of sharp spikes — same problem as xray
+out_E:         clean Compton distribution, no more Pb K spikes, shape matches well
+```
+
+### Key Findings
+
+**TrackID classification fixed scatter dramatically.** Position MAE dropped from 38-52mm to ~10mm. The v1 scatter class was polluted with misclassified Pb K X-rays which had completely different spatial distributions — once removed, the GAN learned scatter position cleanly.
+
+**Xray Kβ lines now reproduced.** The v2 xray PMF includes the 88-95 keV photons that produce Kβ lines (~85-87 keV). All 4 Pb K lines now appear correctly in the energy histogram.
+
+**Phi is the only remaining open problem.** Both xray and scatter out_phi distributions have razor-sharp spikes at ±2 rad (collimator geometry constraint) that a continuous GAN cannot reproduce. Same fix as energy — sample phi from empirical PMF, only ask GAN to learn x, y, theta.
+
