@@ -31,12 +31,14 @@ from torch.utils.data import DataLoader, TensorDataset
 
 IN_COLS          = [0, 1, 2, 3, 4]
 OUT_COLS         = [5, 6, 7, 8, 9]
-OUT_COLS_SPATIAL = [5, 6, 7, 8]        # x, y, theta, phi — no energy
 OUT_E_COL        = 9
+OUT_PHI_COL      = 8
 IS_SECONDARY_COL = 10                  # 1 if outgoing photon is secondary (Pb K X-ray)
 IN_E             = 4
 OUT_E            = 9
 OUT_NAMES_ALL    = ["out_x", "out_y", "out_theta", "out_phi", "out_E"]
+# indices within OUT_COLS (0=x, 1=y, 2=theta, 3=phi, 4=E)
+OUT_X_IDX, OUT_Y_IDX, OUT_THETA_IDX, OUT_PHI_IDX, OUT_E_IDX = 0, 1, 2, 3, 4
 
 DIRECT_REL_TOL = 0.05
 
@@ -106,9 +108,9 @@ class Critic(nn.Module):
         return self.net(torch.cat([x_in, x_out], dim=1)).squeeze(1)
 
 
-def build_energy_pmf(energies, n_bins=500):
-    """Measure empirical energy distribution as a discrete PMF."""
-    counts, edges = np.histogram(energies, bins=n_bins)
+def build_pmf(values, n_bins=500):
+    """Measure empirical distribution of any scalar as a discrete PMF."""
+    counts, edges = np.histogram(values, bins=n_bins)
     centers = 0.5 * (edges[:-1] + edges[1:])
     mask    = counts > 0
     centers = centers[mask].astype(np.float32)
@@ -116,10 +118,34 @@ def build_energy_pmf(energies, n_bins=500):
     return centers, probs
 
 
-def sample_energy(pmf_centers, pmf_probs, n):
-    """Sample n energy values from the empirical PMF."""
+def sample_pmf(pmf_centers, pmf_probs, n):
+    """Sample n values from a discrete PMF."""
     idx = np.random.choice(len(pmf_centers), size=n, p=pmf_probs)
     return pmf_centers[idx]
+
+
+def build_cdf(values, n_bins=2000):
+    """Build empirical CDF: sorted unique values + cumulative probabilities."""
+    sorted_vals = np.sort(values.astype(np.float64))
+    n = len(sorted_vals)
+    # quantile of each value
+    q = (np.arange(n) + 0.5) / n
+    # subsample for efficiency
+    if n > n_bins:
+        step = n // n_bins
+        sorted_vals = sorted_vals[::step]
+        q = q[::step]
+    return sorted_vals.astype(np.float32), q.astype(np.float32)
+
+
+def warp_to_cdf(values, target_sorted, target_q):
+    """
+    Map values through empirical CDF to match a target distribution while
+    preserving rank ordering. The result has the target marginal distribution.
+    """
+    ranks    = np.argsort(np.argsort(values))
+    quantile = (ranks + 0.5) / len(values)
+    return np.interp(quantile, target_q, target_sorted).astype(values.dtype)
 
 
 def gradient_penalty(critic, x_in, real_out, fake_out, device):
@@ -170,12 +196,21 @@ def make_regression_plots(y_true, y_pred, out_file, title):
 
 
 def evaluate_generator(generator, x_test, y_test_full, y_mean, y_std, z_dim, device,
-                       n_samples=5, fix_energy=False, pmf_centers=None, pmf_probs=None):
+                       n_samples=5, fixed_pmfs=None, learn_indices=None,
+                       warp_cdfs=None):
     """
     Generate n_samples outgoing photons per test input.
-    If fix_energy: spatial output from GAN, energy sampled from empirical PMF.
-    y_test_full always has 5 columns for MAE comparison.
+    Fixed outputs are sampled from their PMFs; learned outputs come from the GAN.
+    Optionally, warp specified output columns to match an empirical CDF
+    (sharpens marginal while preserving rank ordering — and thus correlations).
     """
+    if fixed_pmfs is None:
+        fixed_pmfs = {}
+    if learn_indices is None:
+        learn_indices = list(range(5))
+    if warp_cdfs is None:
+        warp_cdfs = {}
+
     generator.eval()
     all_preds = []
     x_t = torch.tensor(x_test, dtype=torch.float32).to(device)
@@ -185,11 +220,18 @@ def evaluate_generator(generator, x_test, y_test_full, y_mean, y_std, z_dim, dev
         for _ in range(n_samples):
             z      = torch.randn(n, z_dim, device=device)
             pred_s = generator(x_t, z).cpu().numpy()
-            pred   = pred_s * y_std + y_mean  # denorm spatial (4 or 5 cols)
+            pred   = pred_s * y_std + y_mean
 
-            if fix_energy:
-                e = sample_energy(pmf_centers, pmf_probs, n).reshape(-1, 1)
-                pred = np.concatenate([pred, e], axis=1)  # now 5 cols
+            if fixed_pmfs:
+                full = np.zeros((n, 5), dtype=np.float32)
+                for j, i in enumerate(learn_indices):
+                    full[:, i] = pred[:, j]
+                for i, (centers, probs) in fixed_pmfs.items():
+                    full[:, i] = sample_pmf(centers, probs, n)
+                pred = full
+
+            for i, (target_sorted, target_q) in warp_cdfs.items():
+                pred[:, i] = warp_to_cdf(pred[:, i], target_sorted, target_q)
 
             all_preds.append(pred)
 
@@ -223,26 +265,38 @@ def train(args):
     y_val   = np.asarray(data[val_idx][:, OUT_COLS],   dtype=np.float32)
     y_test  = np.asarray(data[test_idx][:, OUT_COLS],  dtype=np.float32)
 
-    fix_energy  = args.fix_energy
-    pmf_centers = pmf_probs = None
+    # --- build fixed PMFs for any outputs not learned by the GAN ---
+    fixed_pmfs = {}   # out_idx (0-4) -> (centers, probs)
 
-    if fix_energy:
-        # keep full y_test for MAE comparison, but train only on spatial outputs
-        e_train     = np.asarray(data[train_idx][:, OUT_E_COL], dtype=np.float32)
-        pmf_centers, pmf_probs = build_energy_pmf(e_train)
-        print(f"  Energy PMF built from {len(e_train):,} samples, {len(pmf_centers)} bins")
-        y_train = np.asarray(data[train_idx][:, OUT_COLS_SPATIAL], dtype=np.float32)
-        y_val   = np.asarray(data[val_idx][:, OUT_COLS_SPATIAL],   dtype=np.float32)
-        # y_test keeps all 5 cols for evaluation
-        y_test  = np.asarray(data[test_idx][:, OUT_COLS], dtype=np.float32)
-        out_dim  = 4
-        crit_dim = 9   # 5 incoming + 4 spatial
-    else:
-        out_dim  = 5
-        crit_dim = 10
+    if args.fix_energy:
+        e_train = np.asarray(data[train_idx][:, OUT_E_COL], dtype=np.float32)
+        fixed_pmfs[OUT_E_IDX] = build_pmf(e_train)
+        print(f"  Energy PMF: {len(e_train):,} samples, {len(fixed_pmfs[OUT_E_IDX][0])} bins")
+
+    if args.fix_phi:
+        phi_train = np.asarray(data[train_idx][:, OUT_PHI_COL], dtype=np.float32)
+        fixed_pmfs[OUT_PHI_IDX] = build_pmf(phi_train)
+        print(f"  Phi PMF:    {len(phi_train):,} samples, {len(fixed_pmfs[OUT_PHI_IDX][0])} bins")
+
+    # --- build CDFs for any outputs we'll warp at inference time ---
+    warp_cdfs = {}
+    if args.warp_phi and not args.fix_phi:
+        phi_train_warp = np.asarray(data[train_idx][:, OUT_PHI_COL], dtype=np.float32)
+        warp_cdfs[OUT_PHI_IDX] = build_cdf(phi_train_warp)
+        print(f"  Phi CDF:    {len(phi_train_warp):,} samples for marginal warping")
+
+    learn_indices   = [i for i in range(5) if i not in fixed_pmfs]
+    learn_data_cols = [OUT_COLS[i] for i in learn_indices]
+    out_dim  = len(learn_indices)
+    crit_dim = 5 + out_dim
+
+    if fixed_pmfs:
+        y_train = np.asarray(data[train_idx][:, learn_data_cols], dtype=np.float32)
+        y_val   = np.asarray(data[val_idx][:, learn_data_cols],   dtype=np.float32)
+        y_test  = np.asarray(data[test_idx][:, OUT_COLS],         dtype=np.float32)  # full 5 cols for MAE
 
     x_mean, x_std, (x_train_s, x_val_s, x_test_s) = standardize_from_train(x_train, x_val, x_test)
-    if fix_energy:
+    if fixed_pmfs:
         y_mean, y_std, (y_train_s, y_val_s) = standardize_from_train(y_train, y_val)
     else:
         y_mean, y_std, (y_train_s, y_val_s, _) = standardize_from_train(y_train, y_val, y_test)
@@ -331,7 +385,8 @@ def train(args):
         if epoch % args.plot_every == 0:
             G.load_state_dict(best_G_state)
             mae, y_sample = evaluate_generator(G, x_test_s, y_test, y_mean, y_std, args.z_dim, device,
-                                               fix_energy=fix_energy, pmf_centers=pmf_centers, pmf_probs=pmf_probs)
+                                               fixed_pmfs=fixed_pmfs, learn_indices=learn_indices,
+                                               warp_cdfs=warp_cdfs)
             make_regression_plots(y_test, y_sample, out_dir / f"gan_histograms_epoch{epoch:03d}.png", f"GAN {args.cls} — epoch {epoch}")
             mae_str = "  ".join(f"{n}={v:.4f}" for n, v in zip(OUT_NAMES_ALL, mae))
             print(f"  [eval] MAE: {mae_str}")
@@ -339,7 +394,8 @@ def train(args):
     # final evaluation with best generator
     G.load_state_dict(best_G_state)
     mae, y_sample = evaluate_generator(G, x_test_s, y_test, y_mean, y_std, args.z_dim, device, n_samples=10,
-                                       fix_energy=fix_energy, pmf_centers=pmf_centers, pmf_probs=pmf_probs)
+                                       fixed_pmfs=fixed_pmfs, learn_indices=learn_indices,
+                                       warp_cdfs=warp_cdfs)
     make_regression_plots(y_test, y_sample, out_dir / "gan_histograms_final.png", f"GAN {args.cls} — final")
 
     checkpoint = {
@@ -349,19 +405,18 @@ def train(args):
         "x_mean": x_mean, "x_std": x_std,
         "y_mean": y_mean, "y_std": y_std,
         "input_columns": IN_COLS,
-        "output_columns": OUT_COLS_SPATIAL if fix_energy else OUT_COLS,
+        "output_columns": learn_data_cols,
+        "learn_indices": learn_indices,
+        "fixed_pmfs": {i: (c.tolist(), p.tolist()) for i, (c, p) in fixed_pmfs.items()},
         "class": args.cls,
-        "fix_energy": fix_energy,
         "history": history,
     }
-    if fix_energy:
-        checkpoint["pmf_centers"] = pmf_centers
-        checkpoint["pmf_probs"]   = pmf_probs
     torch.save(checkpoint, out_dir / "generator.pt")
 
     report = {
         "class": args.cls,
-        "fix_energy": fix_energy,
+        "fix_energy": args.fix_energy,
+        "fix_phi": args.fix_phi,
         "data_file": args.data,
         "train_rows": int(len(train_idx)),
         "val_rows": int(len(val_idx)),
@@ -375,7 +430,7 @@ def train(args):
 
     print("\n=== Summary ===")
     print(f"Class: {args.cls}")
-    print(f"Fix energy: {fix_energy}")
+    print(f"Fix energy: {args.fix_energy}  Fix phi: {args.fix_phi}")
     print(f"Best val Wasserstein: {best_val_w:.4f}")
     print("Final MAE (avg over 10 samples):")
     for n, v in zip(OUT_NAMES_ALL, mae):
@@ -400,11 +455,15 @@ def main():
     parser.add_argument("--plot-every", type=int,   default=20,
                         help="Save histogram plots every N epochs")
     parser.add_argument("--fix-energy", action="store_true",
-                        help="For xray: learn only spatial outputs, sample energy from empirical PMF")
+                        help="Sample out_E from empirical PMF instead of learning it")
+    parser.add_argument("--fix-phi", action="store_true",
+                        help="Sample out_phi from empirical PMF instead of learning it")
+    parser.add_argument("--warp-phi", action="store_true",
+                        help="Train phi normally, warp marginal to match empirical CDF at inference (preserves correlations, sharpens marginal)")
     args = parser.parse_args()
 
     if args.out_dir is None:
-        suffix = "_fixE" if args.fix_energy else ""
+        suffix = ("_fixE" if args.fix_energy else "") + ("_fixP" if args.fix_phi else "") + ("_warpP" if args.warp_phi else "")
         args.out_dir = f"ml_artifacts/gan_{args.cls}{suffix}"
 
     train(args)

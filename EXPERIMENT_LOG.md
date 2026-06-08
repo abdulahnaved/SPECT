@@ -529,3 +529,125 @@ out_E:         clean Compton distribution, no more Pb K spikes, shape matches we
 
 **Phi is the only remaining open problem.** Both xray and scatter out_phi distributions have razor-sharp spikes at ±2 rad (collimator geometry constraint) that a continuous GAN cannot reproduce. Same fix as energy — sample phi from empirical PMF, only ask GAN to learn x, y, theta.
 
+---
+
+## Fix-Phi Attempt: Why Decoupling Failed
+
+**Date:** 2026-06-06
+
+Tried generalizing the `--fix-energy` approach to phi: GAN learns only spatial outputs (x, y, theta), phi sampled from empirical PMF at inference.
+
+### Results
+
+**Xray (fix-energy + fix-phi):**
+```text
+                  fix-E only (v2)   fix-E + fix-phi
+val_w:            -0.24            -0.96
+out_x:            9.59 mm          75.55 mm     ← 8x worse
+out_y:            9.97 mm          42.32 mm     ← 4x worse
+out_theta:        0.31 rad         0.39 rad
+```
+
+**Scatter (fix-phi only):**
+```text
+                  v2 (no fix)      fix-phi
+val_w:            -0.66            -0.78
+out_x:            10.96 mm         14.92 mm     ← worse
+out_E:            14.39 keV        33.20 keV    ← 2x worse
+```
+
+### Why This Failed
+
+The lesson is about **independence vs correlation**:
+
+- **Energy is independent.** Pb K X-ray lines are atomic emissions at fixed energies (73, 75, 85, 87 keV) determined by lead's electron shell structure. They do not depend on photon position or trajectory. Removing energy from the GAN's outputs lost no information.
+
+- **Phi is correlated.** The cylindrical hole geometry that produces the discrete phi peaks also constrains position, theta, and (via Compton scattering for the scatter class) energy. Stripping phi from the GAN's joint output destroyed the correlation structure it needed to learn the remaining variables.
+
+For scatter, the Compton scattering energy-angle relationship is especially tight. Removing phi broke the GAN's ability to learn the energy distribution itself — energy MAE doubled even though energy was still being learned.
+
+### General Principle
+
+```text
+fix-mode works ONLY for outputs that are statistically independent
+of the variables the GAN is learning.
+
+fix-energy works for xray because Pb K lines are atomic, independent
+of trajectory.
+
+fix-phi fails because phi is geometrically coupled to position and
+angle, and via scattering kinematics to energy.
+```
+
+### Best Models So Far
+
+```text
+xray:    --fix-energy on v2 data         (val_w -0.24, position ~10 mm)
+scatter: no fix flags on v2 data         (val_w -0.66, position ~10 mm)
+```
+
+---
+
+## Warp-Phi: Rank-Preserving Post-Processing
+
+**Date:** 2026-06-08
+
+After fix-phi failed (decoupling broke correlations), tried a different approach: keep phi in the GAN's joint output so correlations are preserved, but post-process the phi marginal at inference using empirical CDF warping (quantile transformation).
+
+### Method
+
+```
+1. GAN trains on all 5 outputs normally — joint correlations intact.
+2. At inference, rank-sort the GAN's batch of phi values.
+3. Rank-sort an equal-size set of phi values from training data.
+4. Replace each generated phi with the training value at the same rank.
+```
+
+This guarantees the warped phi marginal exactly matches the empirical distribution (sharp spikes appear automatically) while preserving rank correlations with x, y, theta, E.
+
+### Implementation
+
+Added `build_cdf()`, `warp_to_cdf()`, `--warp-phi` flag, and `warp_cdfs` argument to `evaluate_generator()` in `train_gan.py`. Independent of `--fix-phi` — they cannot both be applied to the same column.
+
+### Results: Scatter (z_dim=64, --warp-phi)
+
+```text
+                  v2 baseline      warp-phi (z=64)
+val_w:            -0.66            -0.36       ← raw GAN val_w looks worse
+out_x:            10.96 mm         10.33 mm    ← better
+out_y:            10.26 mm         8.40 mm     ← better
+out_theta:        0.28 rad         0.26 rad    ← better
+out_phi:          1.65 rad         1.60 rad    ← marginal MAE, but see histogram
+out_E:            14.39 keV        11.61 keV   ← better
+```
+
+### Histogram Analysis
+
+```text
+out_x, out_y:  clean overlap, no degradation from warping
+out_theta:     near-perfect overlap, sharp spike near 0 captured
+out_phi:       sharp spikes at -1.5 and +1.5 rad now reproduced exactly,
+               background between spikes also matches MC well
+out_E:         even cleaner than v2, broad Compton shape essentially identical
+```
+
+The phi MAE number is misleading — it stays ~random because the GAN's original phi was noise, and warping noise into a sharp distribution doesn't reduce per-sample MAE. What matters is the **distribution shape**, which now matches MC almost perfectly.
+
+### Why This Works (And Caveats)
+
+```text
+The GAN learns the joint distribution (x, y, theta, phi, E) including
+correlations. Phi rank-warping changes only the absolute phi values,
+not their order. So any monotonic correlation with the other outputs
+is preserved.
+
+Caveat 1: This is statistical post-processing, not a physics-derived
+fix. The marginal is correct by construction; the joint is only
+"best-effort" correct.
+
+Caveat 2: If the GAN's raw phi output is noise (no real correlation),
+warping just gives noise reshaped to the right marginal. Caveats can
+only be ruled out by validating downstream image reconstruction.
+```
+
+
