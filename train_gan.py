@@ -33,6 +33,7 @@ IN_COLS          = [0, 1, 2, 3, 4]
 OUT_COLS         = [5, 6, 7, 8, 9]
 OUT_E_COL        = 9
 OUT_PHI_COL      = 8
+OUT_THETA_COL    = 7
 IS_SECONDARY_COL = 10                  # 1 if outgoing photon is secondary (Pb K X-ray)
 IN_E             = 4
 OUT_E            = 9
@@ -284,6 +285,10 @@ def train(args):
         phi_train_warp = np.asarray(data[train_idx][:, OUT_PHI_COL], dtype=np.float32)
         warp_cdfs[OUT_PHI_IDX] = build_cdf(phi_train_warp)
         print(f"  Phi CDF:    {len(phi_train_warp):,} samples for marginal warping")
+    if args.warp_theta:
+        theta_train_warp = np.asarray(data[train_idx][:, OUT_THETA_COL], dtype=np.float32)
+        warp_cdfs[OUT_THETA_IDX] = build_cdf(theta_train_warp)
+        print(f"  Theta CDF:  {len(theta_train_warp):,} samples for marginal warping")
 
     learn_indices   = [i for i in range(5) if i not in fixed_pmfs]
     learn_data_cols = [OUT_COLS[i] for i in learn_indices]
@@ -460,10 +465,12 @@ def main():
                         help="Sample out_phi from empirical PMF instead of learning it")
     parser.add_argument("--warp-phi", action="store_true",
                         help="Train phi normally, warp marginal to match empirical CDF at inference (preserves correlations, sharpens marginal)")
+    parser.add_argument("--warp-theta", action="store_true",
+                        help="Same as --warp-phi but for theta (sharpens the peak near 0)")
     args = parser.parse_args()
 
     if args.out_dir is None:
-        suffix = ("_fixE" if args.fix_energy else "") + ("_fixP" if args.fix_phi else "") + ("_warpP" if args.warp_phi else "")
+        suffix = ("_fixE" if args.fix_energy else "") + ("_fixP" if args.fix_phi else "") + ("_warpP" if args.warp_phi else "") + ("_warpT" if args.warp_theta else "")
         args.out_dir = f"ml_artifacts/gan_{args.cls}{suffix}"
 
     train(args)

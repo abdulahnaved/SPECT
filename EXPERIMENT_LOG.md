@@ -650,4 +650,76 @@ warping just gives noise reshaped to the right marginal. Caveats can
 only be ruled out by validating downstream image reconstruction.
 ```
 
+---
+
+## Xray With fix-energy + warp-phi
+
+**Date:** 2026-06-09
+**Data:** xray_10B_v2.npy
+**Config:** `--fix-energy --warp-phi`, z_dim=64, 300 epochs
+
+### Results
+
+```text
+                 fix-E only (v2)    fix-E + warp-phi (z=64)
+val_w:           -0.24              -0.22
+out_x:           9.59 mm            5.43 mm   ← better
+out_y:           9.97 mm            11.42 mm  ← slightly worse
+out_theta:       0.31 rad           0.31 rad
+out_phi:         1.60 rad           1.59 rad
+out_E:           4.87 keV           4.88 keV
+```
+
+### Histogram Analysis
+
+```text
+out_x, out_y:  clean overlap
+out_theta:     GAN starts at 0 with a soft slope, MC has a sharp
+               near-vertical peak right at theta=0. Same fundamental
+               GAN limitation that affected phi — continuous generator
+               cannot produce a delta-like peak.
+out_phi:       sharp spikes at -1.5 and +1.5 reproduced exactly
+               (warping working as intended)
+out_E:         all 4 Pb K lines perfect (PMF working as intended)
+```
+
+phi and energy are solved. The remaining issue is the sharp theta peak at 0.
+
+---
+
+## Warp-Theta Extension
+
+**Date:** 2026-06-09
+
+The same continuous-GAN limitation that produces soft phi peaks also produces a soft theta peak at 0. Applying the same CDF warping technique to theta should sharpen it.
+
+### What Changed
+
+Added `--warp-theta` flag to `train_gan.py`. Same mechanism as `--warp-phi`:
+
+```text
+1. Build empirical CDF of theta from training data.
+2. Save it with the model.
+3. At inference, rank-warp the GAN's theta output to match.
+```
+
+Implementation: extended the existing `warp_cdfs` dict in `train()` and `evaluate_generator()` to handle theta in addition to phi. No core algorithm changes.
+
+### Why Theta Warping Is Reasonable
+
+```text
+- Theta peak at 0 = "ballistic" photons going straight through the
+  collimator without scattering. The dominant signal in any SPECT image.
+
+- The same rank-preservation argument applies: where GAN already matches
+  MC, the warp is approximately identity. Only the disagreement near
+  theta=0 gets significantly remapped.
+
+- Cost: small distortion in middle-theta regions where the GAN was
+  already accurate.
+
+- Benefit: sharp peak at 0 appears correctly.
+```
+
+
 
