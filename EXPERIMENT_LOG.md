@@ -87,8 +87,6 @@ regressor smooths sharp energy features around ~75-90 keV
 direction variables show spread in predicted-vs-Monte-Carlo scatter plots
 ```
 
-Professor noted that the jumps around ~80 keV are most likely characteristic X-rays of lead.
-
 Interpretation:
 
 ```text
@@ -131,8 +129,6 @@ adding BatchNorm:   hurts position and classifier, marginal effect on energy
 adding Dropout:     helps out_phi slightly but hurts everything else
 ```
 
-Architecture is near its ceiling for this loss function and dataset size.
-
 ### Why the Remaining Errors Are Hard to Fix
 
 ```text
@@ -144,7 +140,6 @@ out_E:    sharp Pb characteristic X-ray spikes at ~75-88 keV. These are
           MSE regression averages over them and smooths the spikes out.
 ```
 
-Conclusion: further architecture tuning will not meaningfully reduce out_phi or out_E errors. The problem is the loss function and model type, not the depth or width.
 
 ## Multi-Class Classifier And Per-Class Regressors
 
@@ -199,10 +194,6 @@ scatter       7.57     8.90      0.274    1.582   13.78   ← poor
 
 Separating direct photons (in ≈ out) from xray and scatter photons makes the direct mapping nearly trivial. MAE dropped by roughly 2x on position and 7x on direction compared to the single binary regressor.
 
-**Xray and scatter regressors fail due to data scarcity, not architecture:**
-
-With only 6,740 xray and 2,354 scatter photons in 85M total, there is not enough signal to train a reliable regressor. The xray out_E histogram clearly shows two distinct Pb K X-ray lines (Kα ~75 keV, Kβ ~85 keV) which the NN merges into one smeared peak — a sign of averaging over a multi-modal distribution with too few samples.
-
 **Conclusion:**
 
 Architecture changes will not fix xray and scatter. The problem is data scarcity. A larger simulation is needed to produce enough rare-event photons.
@@ -220,9 +211,8 @@ scatter:  nothing matches — distributions are completely off
 
 ## GAN Training On 1B Simulation Data
 
-**Date:** 2026-05-25
 **Script:** `train_gan.py` — WGAN-GP conditional GAN, one model per physical class
-**Data:** `/media/storage/nabdullah/postprocessed_1B.npy` (851,474,815 rows total)
+**Data:** `postprocessed_1B.npy` (851,474,815 rows total)
 **Architecture:** Generator and Critic both 4×256 MLP, z_dim=16 (32 for direct), GP lambda=10, n_critic=5
 
 ### 1B Dataset Statistics
@@ -279,9 +269,6 @@ out_E:          excellent — ~140 keV peak reproduced cleanly
 
 Overall the direct GAN captures the distribution well. The slight softness in `out_phi` is expected — WGAN-GP encourages broad coverage rather than sharp peaks. More latent dimensions (z_dim=32 vs 16) helped.
 
-**Key insight — GAN vs Regressor:**
-The regressor MAE on direct (out_phi ≈ 0.037 rad) looks better than GAN MAE (0.050 rad) but this comparison is misleading. The regressor predicts the conditional mean — it cannot produce the spread of the real distribution. The GAN samples from the distribution, which is what a Monte Carlo surrogate needs. MAE is the wrong metric for generative models.
-
 ### Results: Xray GAN (z_dim=16, 200 epochs)
 
 ```text
@@ -332,7 +319,6 @@ The xray energy distribution is nearly deterministic (Pb Kα ≈ 75 keV, Kβ ≈
 
 ## GAN Training On 10B Data (Xray And Scatter)
 
-**Date:** 2026-06-03
 **Data:** xray_10B.npy (676,692 rows), scatter_10B.npy (244,025 rows)
 **Architecture:** same as 1B run — Generator and Critic 4×256, z_dim=32, GP lambda=10, n_critic=5, 300 epochs
 
@@ -393,9 +379,9 @@ out_E:         broad high-energy hump (100-250 keV) captured reasonably,
 
 **Xray position is solved.** With 676K samples, the xray GAN learned position very well. This is a clear improvement over the 1B run where position was at noise floor.
 
-**The phi sharpness problem is not a data problem.** Both xray and scatter have the same failure: real MC out_phi has razor-sharp discrete spikes, and the GAN produces broad bumps at the right locations. This is a fundamental limitation of continuous generators — they cannot reproduce delta-function-like distributions. More data will not fix this.
+**The phi sharpness problem is not a data problem.** Both xray and scatter have the same failure: real MC out_phi has razor-sharp discrete spikes, and the GAN produces broad bumps at the right locations. This is a fundamental limitation of continuous generators — they cannot reproduce delta-function-like distributions.
 
-**Xray out_E is a quantization problem.** The 4 discrete Pb K emission lines are fixed atomic physics values, not a continuous distribution. A continuous GAN will always smear them. The correct approach is to sample out_E from a discrete mixture of the known lines, not learn it.
+**Xray out_E is a quantization problem.** The 4 discrete Pb K emission lines are fixed atomic physics values, not a continuous distribution. A continuous GAN will always smear them. 
 
 **Scatter is still partially failing.** Wasserstein improved 1.8x over 1B run but position MAEs (38-52mm) are still far from usable. The scatter distribution is genuinely more complex than xray — wide energy range, broad angular spread — and may need architectural changes in addition to more data.
 
@@ -404,8 +390,6 @@ out_E:         broad high-energy hump (100-250 keV) captured reasonably,
 ---
 
 ## Physics-Correct Class Definition Using TrackID
-
-**Date:** 2026-06-03
 
 ### Problem With Energy-Threshold Classification
 
@@ -454,7 +438,7 @@ scatter_10B_v2.npy — scatter photons, now clean of misclassified Pb K X-rays
 
 ### Xray GAN With Fixed Energy (fix-energy mode)
 
-While waiting for v2 data, training xray GAN on old xray_10B.npy with `--fix-energy` flag. In this mode:
+Training xray GAN on old xray_10B.npy with `--fix-energy` flag. In this mode:
 
 ```
 generator learns:  out_x, out_y, out_theta, out_phi  (4 outputs)
@@ -467,7 +451,6 @@ Generator: 5+z_dim → 4, Critic: 9 → 1. Energy PMF built from 473,684 trainin
 
 ## GAN Retraining On v2 Data (TrackID Classification)
 
-**Date:** 2026-06-04
 **Data:** xray_10B_v2.npy, scatter_10B_v2.npy
 **Change:** TrackID-based classification replaces energy threshold classification
 
@@ -527,13 +510,11 @@ out_E:         clean Compton distribution, no more Pb K spikes, shape matches we
 
 **Xray Kβ lines now reproduced.** The v2 xray PMF includes the 88-95 keV photons that produce Kβ lines (~85-87 keV). All 4 Pb K lines now appear correctly in the energy histogram.
 
-**Phi is the only remaining open problem.** Both xray and scatter out_phi distributions have razor-sharp spikes at ±2 rad (collimator geometry constraint) that a continuous GAN cannot reproduce. Same fix as energy — sample phi from empirical PMF, only ask GAN to learn x, y, theta.
+**Phi is the only remaining open problem.** Both xray and scatter out_phi distributions have razor-sharp spikes at ±2 rad (collimator geometry constraint) that a continuous GAN cannot reproduce. 
 
 ---
 
 ## Fix-Phi Attempt: Why Decoupling Failed
-
-**Date:** 2026-06-06
 
 Tried generalizing the `--fix-energy` approach to phi: GAN learns only spatial outputs (x, y, theta), phi sampled from empirical PMF at inference.
 
@@ -589,8 +570,6 @@ scatter: no fix flags on v2 data         (val_w -0.66, position ~10 mm)
 ---
 
 ## Warp-Phi: Rank-Preserving Post-Processing
-
-**Date:** 2026-06-08
 
 After fix-phi failed (decoupling broke correlations), tried a different approach: keep phi in the GAN's joint output so correlations are preserved, but post-process the phi marginal at inference using empirical CDF warping (quantile transformation).
 
@@ -654,7 +633,6 @@ only be ruled out by validating downstream image reconstruction.
 
 ## Xray With fix-energy + warp-phi
 
-**Date:** 2026-06-09
 **Data:** xray_10B_v2.npy
 **Config:** `--fix-energy --warp-phi`, z_dim=64, 300 epochs
 
@@ -689,8 +667,6 @@ phi and energy are solved. The remaining issue is the sharp theta peak at 0.
 
 ## Warp-Theta Extension
 
-**Date:** 2026-06-09
-
 The same continuous-GAN limitation that produces soft phi peaks also produces a soft theta peak at 0. Applying the same CDF warping technique to theta should sharpen it.
 
 ### What Changed
@@ -720,6 +696,39 @@ Implementation: extended the existing `warp_cdfs` dict in `train()` and `evaluat
 
 - Benefit: sharp peak at 0 appears correctly.
 ```
+
+### Warp-Theta Results — Dropped
+
+Ran both classes with `--warp-theta` added. The peak at 0 did sharpen, but it became over-sharpened compared to MC. The rank-warp pushes all the smallest GAN theta values into the first bin, which over-concentrates them. MC has natural sampling spread that the rank-warp loses.
+
+Xray comparison:
+
+```text
+                  fix-E + warp-phi     + warp-theta
+out_x:            5.43 mm              5.19 mm
+out_y:            11.42 mm             9.20 mm
+out_theta peak:   soft slope at 0      over-concentrated at 0
+```
+
+Scatter comparison:
+
+```text
+                  warp-phi             + warp-theta
+out_x:            10.33 mm             12.41 mm
+out_y:            8.40 mm              16.74 mm
+out_E:            11.61 keV            13.74 keV
+```
+
+Scatter degradation is from random training variability (warps are evaluation-only, they don't affect training). But combined with the theta over-sharpening, warp-theta didn't give a clear net benefit.
+
+### Final Best Models
+
+```text
+xray:    --fix-energy --warp-phi    (val_w -0.22, all histograms match MC well)
+scatter: --warp-phi                  (val_w -0.36, all histograms match MC well)
+```
+
+Both classes now have sharp phi spikes, correct energy distributions, and clean position/theta. The theta near-zero peak for xray remains slightly softer than MC — small residual issue, could be addressed in future work with a more careful theta-warping strategy.
 
 
 
