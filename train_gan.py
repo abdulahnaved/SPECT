@@ -5,14 +5,10 @@ Trains a conditional generator that takes an incoming photon + random noise
 and produces a plausible outgoing photon, matching the Monte Carlo distribution.
 
 One GAN per pass class:
-  direct  — run now with 100M dataset
-  xray    — run after 1B dataset is ready
-  scatter — run after 1B dataset is ready
+  direct  
+  xray   
+  scatter 
 
-Usage:
-    uv run python train_gan.py --data /media/storage/nabdullah/postprocessed_100M.npy --class direct
-    uv run python train_gan.py --data /media/storage/nabdullah/postprocessed_1B.npy --class xray
-    uv run python train_gan.py --data /media/storage/nabdullah/postprocessed_1B.npy --class scatter
 """
 
 import argparse
@@ -34,11 +30,10 @@ OUT_COLS         = [5, 6, 7, 8, 9]
 OUT_E_COL        = 9
 OUT_PHI_COL      = 8
 OUT_THETA_COL    = 7
-IS_SECONDARY_COL = 10                  # 1 if outgoing photon is secondary (Pb K X-ray)
+IS_SECONDARY_COL = 10                  
 IN_E             = 4
 OUT_E            = 9
 OUT_NAMES_ALL    = ["out_x", "out_y", "out_theta", "out_phi", "out_E"]
-# indices within OUT_COLS (0=x, 1=y, 2=theta, 3=phi, 4=E)
 OUT_X_IDX, OUT_Y_IDX, OUT_THETA_IDX, OUT_PHI_IDX, OUT_E_IDX = 0, 1, 2, 3, 4
 
 DIRECT_REL_TOL = 0.05
@@ -140,21 +135,12 @@ def build_cdf(values, n_bins=2000):
 
 
 def warp_to_cdf(values, target_sorted, target_q):
-    """
-    Map values through empirical CDF to match a target distribution while
-    preserving rank ordering. The result has the target marginal distribution.
-    """
     ranks    = np.argsort(np.argsort(values))
     quantile = (ranks + 0.5) / len(values)
     return np.interp(quantile, target_q, target_sorted).astype(values.dtype)
 
 
 def gradient_penalty(critic, x_in, real_out, fake_out, device):
-    """
-    WGAN-GP gradient penalty.
-    Interpolates between real and fake outgoing photons and penalises
-    the critic if its gradient norm deviates from 1.
-    """
     batch_size = real_out.size(0)
     alpha = torch.rand(batch_size, 1, device=device)
     interpolated = (alpha * real_out + (1 - alpha) * fake_out).requires_grad_(True)
@@ -199,12 +185,6 @@ def make_regression_plots(y_true, y_pred, out_file, title):
 def evaluate_generator(generator, x_test, y_test_full, y_mean, y_std, z_dim, device,
                        n_samples=5, fixed_pmfs=None, learn_indices=None,
                        warp_cdfs=None):
-    """
-    Generate n_samples outgoing photons per test input.
-    Fixed outputs are sampled from their PMFs; learned outputs come from the GAN.
-    Optionally, warp specified output columns to match an empirical CDF
-    (sharpens marginal while preserving rank ordering — and thus correlations).
-    """
     if fixed_pmfs is None:
         fixed_pmfs = {}
     if learn_indices is None:

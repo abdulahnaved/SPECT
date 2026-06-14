@@ -11,8 +11,6 @@ Classes:
 One 4-class classifier is trained on all photons.
 One regressor per pass class (DIRECT, XRAY, SCATTER) trained only on that class.
 
-Usage:
-    uv run python train_multiclass.py --data /media/storage/nabdullah/postprocessed_100M.npy
 """
 
 import argparse
@@ -125,7 +123,6 @@ def make_loader(x, y, batch_size, shuffle):
 def train_classifier(data, labels, class_counts, out_dir, args, device, rng):
     hidden_dims = tuple(args.hidden_dims)
 
-    # sample blocked so it does not dominate — keep all pass classes
     pass_idx    = np.flatnonzero(labels != BLOCKED)
     blocked_idx = np.flatnonzero(labels == BLOCKED)
     n_sample_blocked = min(len(blocked_idx), len(pass_idx) * args.negative_ratio)
@@ -133,7 +130,6 @@ def train_classifier(data, labels, class_counts, out_dir, args, device, rng):
     all_idx = np.concatenate([pass_idx, sampled_blocked])
     rng.shuffle(all_idx)
 
-    # split each class separately to preserve class balance across splits
     per_class_splits = {}
     for c in range(4):
         cidx = all_idx[labels[all_idx] == c]

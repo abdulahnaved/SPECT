@@ -6,10 +6,6 @@ Each batch:
   - Gets a unique, deterministic seed (base_seed + batch_id).
   - Writes ROOT files to its own output/batch_XXXX/ directory.
   - Keeps file sizes manageable by splitting work across batches.
-
-Usage:
-    python -m collimator_transport.run                     # defaults
-    python -m collimator_transport.run --total 10000000 --batches 10 --workers 4
 """
 
 import argparse

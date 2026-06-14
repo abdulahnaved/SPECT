@@ -1,6 +1,4 @@
 """
-Build and optionally run a single SPECT collimator simulation batch.
-
 Each batch gets its own:
   - Random seed (for reproducibility)
   - Output directory (so ROOT files don't collide between parallel workers)
@@ -21,8 +19,6 @@ def build_simulation(
     output_dir: str = "output",
 ):
     """
-    Construct a fully configured simulation for one batch.
-
     Args:
         n_primaries: number of gamma primaries to shoot.
         seed: fixed random seed for reproducibility.
@@ -63,7 +59,6 @@ def run_batch(
     batch_id: int = 0,
     output_dir: str = "output",
 ):
-    """Build and run one simulation batch. Returns the batch output directory."""
     sim = build_simulation(
         n_primaries=n_primaries,
         seed=seed,

@@ -9,11 +9,6 @@ already lives. It produces:
   - predicted-vs-Monte-Carlo scatter plots for the regressor
   - a compact JSON summary
 
-Example on the server:
-    uv run python validate_model.py \
-      --data /media/storage/nabdullah/postprocessed_100M.npy \
-      --model-dir /media/storage/nabdullah/ml_100M \
-      --out-dir /media/storage/nabdullah/validation_100M
 """
 
 import argparse

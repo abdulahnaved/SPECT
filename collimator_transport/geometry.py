@@ -4,8 +4,6 @@ import math
 
 def build_world_and_collimator(sim):
     """
-    Configure the world and add the collimator volume.
-
     World:
       - Filled with air
       - Same size as the collimator in X and Y

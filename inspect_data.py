@@ -1,8 +1,5 @@
 """
 Quick inspection of the postprocessed numpy array.
-
-Usage:
-    python inspect_data.py
 """
 
 import numpy as np

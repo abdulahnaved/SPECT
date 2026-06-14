@@ -4,8 +4,6 @@ Quick single-batch run + report (for testing).
 For parallel multi-batch runs use:
     python -m collimator_transport.run --total 10000000 --batches 10 --workers 4
 
-Usage:
-    python run_and_report.py
 """
 
 import sys

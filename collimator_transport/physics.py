@@ -6,14 +6,6 @@ import opengate as gate
 
 
 def configure_physics(sim, collimator, hole_region):
-    """
-    Configure physics so that characteristic X-rays of lead (~80 keV) can be
-    generated in the collimator.
-
-    - Enable fluorescence (fluo) in EM parameters.
-    - Set production cuts in the collimator (and hole region) low enough
-      that low-energy secondaries (e.g. leading to Pb K X-rays) are produced.
-    """
     mm = gate.g4_units.mm
 
     # Enable fluorescence so Geant4 can produce characteristic X-rays (e.g. Pb K ~72–88 keV)
