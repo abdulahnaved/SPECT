@@ -9,6 +9,9 @@ phsp/
 output/
 *.npy
 
+# ML artifacts (checkpoints, plots, per-run reports)
+ml_artifacts/
+
 # IDE
 .vscode/
 .cursor/

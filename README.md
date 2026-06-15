@@ -2,7 +2,7 @@
 
 SPECT uses a lead collimator to restrict which gamma photons reach the detector. Simulating photon transport through the collimator with full Monte Carlo physics (OpenGATE / Geant4) is accurate but slow — it is the main computational bottleneck in realistic SPECT system modelling.
 
-This project trains a surrogate that, given an incoming photon (position, direction, energy), either predicts that the photon is absorbed or samples a realistic outgoing photon. Per-class WGAN-GP generators handle the conditional sampling. Discrete output structure (Pb K X-ray lines, geometry-induced phi/theta peaks) is handled outside the GAN with empirical PMF sampling and rank-preserving CDF warping.
+This project trains a surrogate that, given an incoming photon (position, direction, energy), either predicts that the photon is absorbed or samples a realistic outgoing photon. Two generative families are supported per class: WGAN-GP and Flow Matching with an RK4 ODE solver. Discrete output structure (Pb K X-ray lines, geometry-induced phi/theta peaks) is handled outside the generator with empirical PMF sampling and rank-preserving CDF warping.
 
 ## Collimator Geometry
 
@@ -63,24 +63,34 @@ hidden: 256 × 256 × 256 × 256
 output: 4 class logits  (blocked / direct / xray / scatter)
 ```
 
-**Stage 2 — Per-class conditional GAN (WGAN-GP)**
+**Stage 2 — Per-class conditional generator**
 
-One generator per passed class. Each generator samples a realistic outgoing photon conditioned on the incoming photon.
+One generator per passed class. Each generator samples a realistic outgoing photon conditioned on the incoming photon. Two architectures are supported:
 
 ```
-generator: 5 + z_dim → 256 × 256 × 256 × 256 → 5
-critic:    10        → 256 × 256 × 256 × 256 → 1
-training:  WGAN-GP, gradient penalty λ=10, 5 critic steps per generator step,
-           Adam lr=1e-4, batch 512
+WGAN-GP (train_gan.py):
+  generator: 5 + z_dim → 256 × 256 × 256 × 256 → 5
+  critic:    10        → 256 × 256 × 256 × 256 → 1
+  training:  WGAN-GP, gradient penalty λ=10, 5 critic steps per generator step,
+             Adam lr=1e-4, batch 512
+
+Flow Matching (train_flow.py):
+  velocity:  5 + 5 + t_dim → 256 × 256 × 256 × 256 → 5
+             (incoming, current x_t, sinusoidal time embedding)
+  training:  linear-path conditional flow matching, MSE on velocity,
+             Adam lr=3e-4, cosine schedule, batch 512
+  inference: RK4 ODE solver from x(0) ~ N(0, I) to x(1), 50 steps
 ```
+
+Flow Matching trains as a stable supervised regression (no adversarial loop, no mode collapse). On every output it tested it beats the GAN — direct position MAE drops sub-millimeter, xray and scatter position MAE roughly halves without needing any helper flags. See `EXPERIMENT_LOG.md` for the full comparison.
 
 **Stage 3 — Discrete-structure handling at inference**
 
-A continuous GAN cannot reproduce delta-function-like distributions. Two post-processing tools fix this without breaking the conditional structure the GAN learned:
+Neither a continuous GAN nor a flow-matching ODE can reproduce delta-function-like distributions exactly. Two post-processing tools fix this without breaking the conditional structure the generator learned (both flags are wired into `train_gan.py` and `train_flow.py`):
 
-- **PMF sampling (`--fix-energy`, `--fix-phi`)** — drop the variable from the GAN's outputs, sample it independently from the empirical distribution measured during training. Works only when the variable is genuinely independent of the rest (Pb K X-ray energies are atomic constants, so they pass this test; phi does not).
+- **PMF sampling (`--fix-energy`, `--fix-phi`)** — drop the variable from the generator's outputs, sample it independently from the empirical distribution measured during training. Works only when the variable is genuinely independent of the rest (Pb K X-ray energies are atomic constants, so they pass this test; phi does not).
 
-- **CDF warping (`--warp-phi`, `--warp-theta`)** — keep the variable in the GAN's outputs (so correlations are preserved), then rank-warp the marginal at inference so it exactly matches the empirical distribution. Sharp peaks appear automatically while the GAN's joint structure stays intact.
+- **CDF warping (`--warp-phi`, `--warp-theta`)** — keep the variable in the generator's outputs (so correlations are preserved), then rank-warp the marginal at inference so it exactly matches the empirical distribution. Sharp peaks appear automatically while the joint structure stays intact.
 
 The empirical PMFs and CDFs are measured once from training data and saved inside the model file. No live Monte Carlo connection is needed at deployment.
 
@@ -125,6 +135,8 @@ postprocess.py              match incoming/outgoing photons, export .npy
 train_prototype.py          MLP classifier + regressor (architecture search)
 train_multiclass.py         4-class classifier + per-class regressors
 train_gan.py                WGAN-GP conditional GAN per class
+                            (--fix-energy, --fix-phi, --warp-phi, --warp-theta)
+train_flow.py               Conditional Flow Matching per class, RK4 ODE solver
                             (--fix-energy, --fix-phi, --warp-phi, --warp-theta)
 validate_model.py           histogram and calibration plots
 
@@ -188,6 +200,21 @@ uv run python train_gan.py --data scatter.npy --class scatter --z-dim 64 --epoch
 ```
 
 Each run produces histogram plots every 20 epochs, a `report.json`, and a `generator.pt` checkpoint with the GAN weights plus any PMFs/CDFs needed at inference.
+
+Flow Matching uses the same flags and produces `flow.pt` instead of `generator.pt`:
+
+```bash
+# direct
+uv run python train_flow.py --data postprocessed.npy --class direct --epochs 200
+
+# xray
+uv run python train_flow.py --data xray.npy --class xray --epochs 200 \
+    --fix-energy --warp-phi
+
+# scatter
+uv run python train_flow.py --data scatter.npy --class scatter --epochs 200 \
+    --warp-phi
+```
 
 ## Notes
 

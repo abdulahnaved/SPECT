@@ -730,5 +730,100 @@ scatter: --warp-phi                  (val_w -0.36, all histograms match MC well)
 
 Both classes now have sharp phi spikes, correct energy distributions, and clean position/theta. The theta near-zero peak for xray remains slightly softer than MC — small residual issue, could be addressed in future work with a more careful theta-warping strategy.
 
+---
 
+## Flow Matching Surrogate
 
+**Script:** `train_flow.py` — Conditional Flow Matching, one velocity network per class
+**Data:** `postprocessed_1B.npy` (direct), `xray_10B_v2.npy`, `scatter_10B_v2.npy`
+**Architecture:** VelocityNet 4×256 MLP with sinusoidal time embedding (t_dim=64), SiLU activations
+**Training:** Adam lr=3e-4, cosine annealing, MSE on velocity, 200 epochs, batch=512
+**Inference:** RK4 ODE solver, 50 steps from x(0) ~ N(0, I) to x(1)
+
+```text
+sample x_0 ~ N(0, I), x_1 = real outgoing photon, t ~ U(0, 1)
+linear path x_t = (1 - t) * x_0 + t * x_1
+target velocity v_t = x_1 - x_0  (constant along the path)
+loss = MSE(net(x_in, x_t, t), v_t)
+```
+
+### Results: Direct Flow (z_dim N/A, 200 epochs)
+
+```text
+best_val_loss:  0.0153
+final MAE:
+  out_x:      0.23 mm
+  out_y:      0.22 mm
+  out_theta:  0.006 rad
+  out_phi:    0.035 rad
+  out_E:      0.20 keV
+train/val rows: 758,132 / 162,457
+```
+
+### Results: Xray Flow (v2 data, no fix-energy, no warp, 200 epochs)
+
+```text
+best_val_loss:  0.7934
+final MAE:
+  out_x:      1.36 mm
+  out_y:      5.64 mm
+  out_theta:  0.29 rad
+  out_phi:    1.59 rad
+  out_E:      4.83 keV
+train/val rows: 492,234 / 105,478
+```
+
+### Results: Scatter Flow (v2 data, no fix-energy, no warp, 200 epochs)
+
+```text
+best_val_loss:  0.6588
+final MAE:
+  out_x:      3.33 mm
+  out_y:      6.24 mm
+  out_theta:  0.26 rad
+  out_phi:    1.55 rad
+  out_E:      11.68 keV
+train/val rows: 153,792 / 32,955
+```
+
+### Flow vs GAN Comparison
+
+Direct (vs best GAN, z_dim=32):
+
+| Metric | GAN (1B) | Flow (1B) | Improvement |
+|---|---|---|---|
+| out_x MAE  | 5.49 mm   | **0.23 mm** | 24x |
+| out_y MAE  | 2.99 mm   | **0.22 mm** | 14x |
+| out_theta  | 0.020 rad | **0.006 rad** | 3.3x |
+| out_phi    | 0.050 rad | **0.035 rad** | 1.4x |
+| out_E      | 1.35 keV  | **0.20 keV** | 6.8x |
+
+Xray (vs best GAN: `--fix-energy --warp-phi`, z_dim=64):
+
+| Metric | GAN best | Flow (raw, no flags) |
+|---|---|---|
+| out_x MAE | 5.43 mm   | **1.36 mm** |
+| out_y MAE | 11.42 mm  | **5.64 mm** |
+| out_theta | 0.31 rad  | 0.29 rad |
+| out_phi   | 1.59 rad  | 1.59 rad |
+| out_E     | 4.88 keV  | 4.83 keV |
+
+Scatter (vs best GAN: `--warp-phi`, z_dim=64):
+
+| Metric | GAN best | Flow (raw, no flags) |
+|---|---|---|
+| out_x MAE | 10.33 mm  | **3.33 mm** |
+| out_y MAE | 8.40 mm   | **6.24 mm** |
+| out_theta | 0.26 rad  | 0.26 rad |
+| out_phi   | 1.60 rad  | 1.55 rad |
+| out_E     | 11.61 keV | 11.68 keV |
+
+### Key Findings
+
+**Direct flow is a clear win.** Every per-output MAE is better than the best GAN by 1.4–24x. Position drops from millimeters to sub-millimeter. 
+
+**Xray and scatter flows beat GAN on position without any helper flags.** The flow model — without `--fix-energy`, `--warp-phi`, or `--warp-theta` — already matches or exceeds the best GAN runs that needed both fixes. Position MAE roughly halved for xray and dropped 3x for scatter.
+
+**Phi and discrete-energy limits persist.** The continuous-generator limitation that produced soft phi peaks and smeared Pb K lines for the GAN also applies to the flow.
+
+**Flow's out_E is surprisingly close to GAN-with-fix-energy.** For xray the flow's raw out_E MAE (4.83 keV) matches the GAN's `--fix-energy` PMF-sampling result (4.88 keV). The flow is approximating the discrete Pb K structure better than the GAN ever did in raw mode. 

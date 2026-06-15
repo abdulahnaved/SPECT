@@ -3,10 +3,9 @@ Multi-class collimator transport model.
 
 Classes:
   0  BLOCKED  photon did not exit
-  1  DIRECT   photon exited with energy close to incoming (within 5%)
-  2  XRAY     photon exited at Pb characteristic X-ray energy (~70-90 keV)
-              but came in above 95 keV (so it was absorbed and re-emitted)
-  3  SCATTER  photon exited but lost significant energy (Compton scatter)
+  1  DIRECT   primary photon exited with energy close to incoming (within 5%)
+  2  XRAY     outgoing photon is a secondary (TrackID > 1) — Pb fluorescence
+  3  SCATTER  primary photon exited after losing significant energy (Compton)
 
 One 4-class classifier is trained on all photons.
 One regressor per pass class (DIRECT, XRAY, SCATTER) trained only on that class.
@@ -31,6 +30,7 @@ IN_COLS  = [0, 1, 2, 3, 4]
 OUT_COLS = [5, 6, 7, 8, 9]
 IN_E  = 4
 OUT_E = 9
+IS_SECONDARY_COL = 10
 
 CLASS_NAMES = ["blocked", "direct", "xray", "scatter"]
 BLOCKED = 0
@@ -38,22 +38,20 @@ DIRECT  = 1
 XRAY    = 2
 SCATTER = 3
 
-XRAY_LO  = 70.0   # keV — lower bound of Pb K X-ray window
-XRAY_HI  = 90.0   # keV — upper bound
-XRAY_MIN_IN_E = 95.0  # keV — incoming energy must be above X-ray window to be labelled XRAY
 DIRECT_REL_TOL = 0.05  # |out_E - in_E| / in_E < 5% => direct
 
 
 def assign_classes(data):
-    in_e  = data[:, IN_E]
-    out_e = data[:, OUT_E]
+    in_e         = data[:, IN_E]
+    out_e        = data[:, OUT_E]
+    is_secondary = data[:, IS_SECONDARY_COL] > 0
 
     labels = np.full(len(data), BLOCKED, dtype=np.int64)
 
-    passed = out_e > 0
-    xray   = passed & (out_e >= XRAY_LO) & (out_e <= XRAY_HI) & (in_e > XRAY_MIN_IN_E)
-    direct = passed & ~xray & (np.abs(out_e - in_e) / np.maximum(in_e, 1e-6) < DIRECT_REL_TOL)
-    scatter = passed & ~xray & ~direct
+    passed  = out_e > 0
+    xray    = passed & is_secondary
+    direct  = passed & ~is_secondary & (np.abs(out_e - in_e) / np.maximum(in_e, 1e-6) < DIRECT_REL_TOL)
+    scatter = passed & ~is_secondary & ~direct
 
     labels[direct]  = DIRECT
     labels[xray]    = XRAY
@@ -120,7 +118,7 @@ def make_loader(x, y, batch_size, shuffle):
     )
 
 
-def train_classifier(data, labels, class_counts, out_dir, args, device, rng):
+def train_classifier(data, labels, out_dir, args, device, rng):
     hidden_dims = tuple(args.hidden_dims)
 
     pass_idx    = np.flatnonzero(labels != BLOCKED)
@@ -421,7 +419,7 @@ def main():
     }
 
     print("\n--- Training multi-class classifier ---")
-    report["classifier"] = train_classifier(data, labels, class_counts, out_dir, args, device, rng)
+    report["classifier"] = train_classifier(data, labels, out_dir, args, device, rng)
 
     print("\n--- Training per-class regressors ---")
     report["regressors"] = {}
